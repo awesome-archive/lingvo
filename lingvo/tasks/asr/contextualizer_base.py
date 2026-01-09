@@ -13,10 +13,6 @@
 # limitations under the License.
 """API for context injection into a speech decoder."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from lingvo.core import base_layer
 
 

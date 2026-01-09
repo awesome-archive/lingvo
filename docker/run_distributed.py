@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,17 +30,11 @@ the shared filesystem. The trainer jobs are configured via a cluster spec
 flag, whereas the decoder jobs are configured with individual flags.
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
 from pipes import quote as shell_quote
 import shutil
-import six
 import subprocess
 import sys
-
 
 _SYNC_TRAIN_CLUSTER_SPEC = {
     "worker": [
@@ -143,7 +136,7 @@ def _Machine(machine_port):
 
 
 def Cleanup():
-  specs = TRAIN_CLUSTER_SPEC.values() + DECODE_CLUSTER_SPEC.values()
+  specs = list(TRAIN_CLUSTER_SPEC.values()) + list(DECODE_CLUSTER_SPEC.values())
   for job_machines in specs:
     machines = [_Machine(x) for x in job_machines]
     _RunDocker(["stop", "-t", "0"] + machines)
@@ -152,12 +145,12 @@ def Cleanup():
 
 
 def InitFiles():
-  os.mkdir(SHARED_FS_MOUNTPOINT, 01777)
+  os.mkdir(SHARED_FS_MOUNTPOINT, 0o1777)
   # Create these directories so that we own them, not root.
-  os.mkdir(SHARED_FS_MOUNTPOINT + "/log", 01777)
-  os.mkdir(SHARED_FS_MOUNTPOINT + "/log/train", 01777)
-  os.mkdir(SHARED_FS_MOUNTPOINT + "/log/decoder_test", 01777)
-  os.mkdir(SHARED_FS_MOUNTPOINT + "/log/eval_test", 01777)
+  os.mkdir(SHARED_FS_MOUNTPOINT + "/log", 0o1777)
+  os.mkdir(SHARED_FS_MOUNTPOINT + "/log/train", 0o1777)
+  os.mkdir(SHARED_FS_MOUNTPOINT + "/log/decoder_test", 0o1777)
+  os.mkdir(SHARED_FS_MOUNTPOINT + "/log/eval_test", 0o1777)
 
 
 def InitNetwork():
@@ -165,7 +158,7 @@ def InitNetwork():
 
 
 def StartFleet():
-  specs = TRAIN_CLUSTER_SPEC.values() + DECODE_CLUSTER_SPEC.values()
+  specs = list(TRAIN_CLUSTER_SPEC.values()) + list(DECODE_CLUSTER_SPEC.values())
   for job_machines in specs:
     for machine_port in job_machines:
       machine_name = _Machine(machine_port)
@@ -191,7 +184,7 @@ def CopyTrainerToSharedMount():
 def InstallAndStartProcess(cluster_spec):
   """Unpacks the trainer and kick off training."""
   cluster_spec_flag = MakeFlagClusterSpec(cluster_spec)
-  for job_name, machines in six.iteritems(cluster_spec):
+  for job_name, machines in cluster_spec.items():
     task_idx = 0
     for machine_port in machines:
       machine_name = _Machine(machine_port)

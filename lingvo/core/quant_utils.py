@@ -14,17 +14,49 @@
 # ==============================================================================
 """Utilities for model quantization."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+import enum
+from typing import Iterable, Optional
 
-import numpy as np
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import hyperparams
 from lingvo.core import py_utils
 from lingvo.core import summary_utils
+import numpy as np
+
+
+@enum.unique
+class QDistribution(str, enum.Enum):
+  """Distribution type for the inputs for QDomain.
+
+  Symmetric and positive represent general signed and unsigned inputs, while
+  padding, relu, ... allow for quantization using known ranges.
+  """
+  # General distributions.
+  SYMMETRIC = 'symmetric'
+  POSITIVE = 'positive'
+  # Specific activation distributions.
+  LOG_SOFTMAX = 'log_softmax'
+  PADDING = 'padding'
+  RANDOM_UNIFORM = 'random_uniform'
+  RELU = 'relu'
+  RELU6 = 'relu6'
+  SIGMOID = 'sigmoid'
+  SOFTMAX = 'softmax'
+  TANH = 'tanh'
+
+  @classmethod
+  def IsPositive(cls, dist: 'QDistribution') -> bool:
+    return dist in [
+        QDistribution.POSITIVE,
+        QDistribution.PADDING,
+        QDistribution.RANDOM_UNIFORM,
+        QDistribution.RELU,
+        QDistribution.RELU6,
+        QDistribution.SIGMOID,
+        QDistribution.SOFTMAX,
+        QDistribution.TANH,
+    ]
 
 
 class QuantizableLayer(base_layer.BaseLayer):
@@ -59,17 +91,11 @@ class QuantizableLayer(base_layer.BaseLayer):
 
   The "decorators" are:
 
-  - QWeight: Tags a tensor (typically a var) as a weight quantized type.
-  - QR* (QRTanh, QRSigmoid, QRSoftmax, etc): Tags a tensor as the result
-    of a fixed activation function with a known output range (the range
-    is implied in the name).
-  - QRPadding: Tags a tensor as containing a padding value (as we define
-    them as 0..1). While such values are numeric, they generally exist with
-    very different ranges from the rest of the graph and should not be
-    arithmetically combined with tensors that may have a different/variable
-    range.
-  - QTensor: Tags a tensor as a generic quantized intermediate value.
-    These are also tagged with a layer-unique name. All QTensors with the
+  - QWeight: Tags a weight (typically a tf.Variable) as a weight quantized type.
+  - QRAct(act, dist: QDistribution): Tags an activation with a known or
+    configurable quantization range.
+  - QAct: Tags an activation as a generic quantized intermediate value.
+    These are also tagged with a layer-unique name. All QActs with the
     same name will be considered the same from a numerical range/precision
     perspective.
 
@@ -88,7 +114,6 @@ class QuantizableLayer(base_layer.BaseLayer):
   RNN cell that uses 8bit quantization for inputs/outputs and 16bit
   quantization for internal state arithmetic). Such uses should be rare.
 
-
   **Convenience functions:**
 
   The layer adds a number of convenience functions to the layer's 'fns'
@@ -96,285 +121,1022 @@ class QuantizableLayer(base_layer.BaseLayer):
   automatically add the necessary annotations. All such functions take the
   following named parameters:
 
-    - qt: Name of QTensor (setup with TrackQTensor) for dynamic range tracking.
-    - qmin/qmax/qdomain: Constant min/max range plus optional QDomain name to
-      resolve against. Typically, only qmin/qmax are used.
+    - qout_name: Name of QAct (setup with TrackQActs) for dynamic range
+      tracking.
 
   Functions that have a natural output range will have default values for
   qmin/qmax so that they just work. Functions that do not have a natural
-  output range must have either qt or qmin/qmax specified manually.
+  output range must use qout_name.
 
-  Natural range functions
+  Natural or configurable range functions
 
   - qtanh
   - qsigmoid
   - qsoftmax
+  - qrelu  (quantized to [0, 1])
+  - qrelu6
+  - qlogsoftmax  (configured in FakeQDomain.Params)
+  - qrandom_uniform
 
   Dynamic range functions:
 
   - qadd
+  - qsubtract
   - qmultiply
-  - qmatmul (defers to `.py_utils.Matmul` and only accepts rank-2 tensors)
-  - qbatchmatmul (defers to `tf.matmul` directly)
+  - qlog
+
   """
 
   @classmethod
   def Params(cls):
-    p = super(QuantizableLayer, cls).Params()
+    p = super().Params()
     p.Define('qdomain', hyperparams.Params(),
              'Container for quantization domains.')
     p.qdomain.Define('default', None, 'Default quantization domain.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(QuantizableLayer, self).__init__(params)
+    super().__init__(params)
     p = self.params
 
-    self._tracked_tensors = dict()  # tracked t_name -> (QDomain)
-    self._qstate = None  # t_name -> Tensor
+    # A set of all tracked activation and weight names.
+    self._all_names = set()
+    self._act_name_to_qdomain_name = dict()
+    self._weight_name_to_qdomain_name = dict()
 
     # Instantiate quantization domains.
-    with tf.variable_scope(p.name + '/q'):
-      self._qdomains = dict()  # Dict of qdname -> QDomain or None
-      for qdname in dir(p.qdomain):
-        qdparams = p.qdomain.Get(qdname)
-        if qdparams is None:
-          continue
-        assert issubclass(qdparams.cls, QDomain), (
-            'Expected quantized domain %s to extend QDomain' % qdname)
+    self._qdomains = dict()  # Dict of qdname -> QDomain or None
+    for qdname in dir(p.qdomain):
+      qdparams = p.qdomain.Get(qdname)
+      if qdparams is None:
+        self._qdomains[qdname] = None
+      else:
+        if not issubclass(qdparams.cls, QDomain):
+          raise TypeError(f'Expected p.qdomain.{qdname} to extend QDomain, but '
+                          f'got {qdparams.cls}')
         qdchild_name = 'qdomain_' + qdname
         self.CreateChild(qdchild_name, qdparams)
         self._qdomains[qdname] = self.children[qdchild_name]
     self._AddQuantizationFunctions()
 
+  def _child_variable_scope_override(self):
+    p = self.params
+    res = super()._child_variable_scope_override()
+    for qdname in dir(p.qdomain):
+      qdparams = p.qdomain.Get(qdname)
+      if qdparams is None:
+        continue
+      qdchild_name = 'qdomain_' + qdname
+      res[qdchild_name] = [p.name + '/q']
+    return res
 
-  def QRTanh(self, t, domain='actf'):
-    """Quantizes the output of a tanh (-1.0, 1.0)."""
-    qd = self.GetQDomain(domain)
-    return qd.QuantizeNaturalRange(t, -1.0, 1.0) if qd else t
+  def TrackQActs(self,
+                 *act_names: str,
+                 shape: Optional[Iterable[int]] = None,
+                 feature_axes: Optional[Iterable[int]] = None,
+                 domain: str = 'default'):
+    """Track activations and create variables for quantization as needed.
 
-  def QRSigmoid(self, t, domain='actf'):
-    """Quantizes the output of a sigmoid (0, 1.0)."""
-    qd = self.GetQDomain(domain)
-    return qd.QuantizeNaturalRange(t, 0.0, 1.0) if qd else t
-
-  def QRSoftmax(self, t, domain='softmax', narrow_to_asym_bit_depth=False):
-    """Quantizes the output of a softmax (0, 1.0 - 1.0/2^-bits)."""
-    qd = self.GetQDomain(domain)
-    # Override based on TFLite softmax support.
-    softmax_max = 1.0
-    if qd is not None and narrow_to_asym_bit_depth:
-      softmax_max = (2**qd.bits - 1) / (2**qd.bits)
-    return qd.QuantizeNaturalRange(t, 0.0, softmax_max) if qd else t
-
-  def QRRelu(self, t, domain='relu'):
-    """Quantizes the output of a softmax (0, 1.0)."""
-    qd = self.GetQDomain(domain)
-    return qd.QuantizeNaturalRange(t, 0.0, 1.0) if qd else t
-
-  def QRRelu6(self, t, domain='relu6'):
-    """Quantizes the output of a softmax (0, 1.0)."""
-    qd = self.GetQDomain(domain)
-    return qd.QuantizeNaturalRange(t, 0.0, 6.0) if qd else t
-
-  def QRPadding(self, t, domain='padding'):
-    """Quantizes the padding."""
-    qd = self.GetQDomain(domain)
-    return qd.QuantizeConstantRange(t, 0.0, 1.0) if qd else t
-
-  def TrackQTensor(self, *t_names, **kwargs):
-    r"""Creates one or more QTensors for later use.
-
-    Any tensor that will later be quantized must be created first, preferably
-    in __init__.
-
-    Along with a list of tensor names to create, they can be associated with
-    a 'domain'. Most layers are simple enough to only have a single quantization
-    domain (QDomain), typically 'default'. However, additional QDomains can
-    be defined as parameters to control fine grained aspects of quantization.
-
-    If no explicit domain is passed, then the domain ('tensor\_' + t_name) is
-    tried. If that is not defined, then 'default'.
+    The activations will be associated with a specific named QDomain. Most
+    layers are simple enough to only require a single 'default' QDomain.
+    Additional QDomains can be defined as parameters to control fine grained
+    aspects of quantization.
 
     Args:
-      *t_names: Positional parameters are taken to be QTensor names to create.
-      **kwargs: Can contain an explicit 'domain'. Written this way due to
-        python2 limitations.
+      *act_names: A sequence of names to use to track statistics for layer
+        activations.
+      shape: The optional shape of the activation(s) to track. Can be used for
+        static per-channel activation quantization.
+      feature_axes: The optional feature axes of the activation(s) to track. Can
+        be used for static per-channel activation quantization.
+      domain: The name of the QDomain to use to for quantization.
     """
-    domain_override = kwargs['domain'] if 'domain' in kwargs else None
-    for t_name in t_names:
-      domain = domain_override
-      if domain is None:
-        domain = 'tensor_' + t_name
-      qd = self.GetQDomain(domain)
-      self._tracked_tensors[t_name] = qd
-      if qd:
-        qd.CreateTensor(t_name)
+    for act_name in act_names:
+      if act_name in self._all_names:
+        raise ValueError(
+            f"act_name='{act_name}' is already tracked for this layer.")
+      self._all_names.add(act_name)
+      self._act_name_to_qdomain_name[act_name] = domain
+    qd = self._GetQDomain(domain)
+    if qd is not None:
+      qd.TrackQActs(*act_names, shape=shape, feature_axes=feature_axes)
 
-  def QTensor(self, t_name, t, eval_only=False):
-    """Quantizes a general tensor input/output in one step.
+  def TrackQWeight(self,
+                   weight_name,
+                   shape,
+                   feature_axis,
+                   domain: str = 'default',
+                   *,
+                   tensor_split_dims_mapping=None,
+                   device_mesh=None,
+                   legacy_aqt_weight_name=None):
+    """Creates Quantized weights for later use.
 
-    t_name must have been previously created via TrackQTensor.
+    Weight that will later be quantized must be created first, preferably
+    in _CreateLayerVariables().
 
     Args:
-      t_name: Previously created QTensor t_name to quantize to.
-      t: Tensor to quantize.
+      weight_name: Positional parameters are taken to be weight names to create.
+      shape: Shape of the weight.
+      feature_axis: axis corresponding to output channel/feature for weights.
+      domain: Name of the QDomain to use for quantization.
+      tensor_split_dims_mapping: A list of integers that map each tensor axis to
+        the device mesh axis along which it is sharded.
+      device_mesh: A numpy.ndarray describing the topology of a device mesh to
+        partition the created variable onto.
+      legacy_aqt_weight_name: Used for compatibility with old checkpoints.
+    """
+    if weight_name in self._all_names:
+      raise ValueError(
+          f"weight_name='{weight_name}' is already tracked for this layer.")
+    self._all_names.add(weight_name)
+    self._weight_name_to_qdomain_name[weight_name] = domain
+    qd = self._GetQDomain(domain)
+    if qd is not None:
+      # We're calling child.CreateVariable() here rather than
+      # self.CreateVariable(), which messes up the automatic variable scope
+      # handing, so we need to set some manual variable scopes for backwards
+      # compatibility.
+      for qdname in self._qdomains:
+        if qd is self._qdomains[qdname]:
+          qdchild_name = 'qdomain_' + qdname
+          with self._CreateChildContext(qdchild_name):
+            with tf.variable_scope(qd.params.name):
+              qd.TrackQWeight(weight_name, shape, feature_axis,
+                              tensor_split_dims_mapping, device_mesh,
+                              legacy_aqt_weight_name)
+          break
+
+  def QAct(self, act_name, act, eval_only=False):
+    """Quantizes an activation.
+
+    act_name must have been previously created via TrackQActs.
+
+    Args:
+      act_name: Previously created act_name to quantize to.
+      act: Activation to quantize.
       eval_only: Whether to only apply quantization pressure at eval time.
+
     Returns:
       The tensor, quantized.
     """
-    return self.QTensorMulti(t_name, t, eval_only=eval_only)[0]
-
-  def QTensorMulti(self, t_name, *ts, **kwargs):
-    """Quantizes multiple tensors simultaneously.
-
-    t_name must have been previously created via TrackQTensor.
-
-    This is different from multiple calls to QTensor because each of the
-    tensors will contribute to the min/max of the same constraint.
-    Typically used for tensors that are being added together.
-
-    Args:
-      t_name: Previously created QTensor t_name to quantize to.
-      *ts: Tensor to quantize.
-      **kwargs: Additional kwargs as per QTensor.
-    Returns:
-      Tuple of quantized tensors.
-    """
-    assert t_name in self._tracked_tensors, (
-        ('Call to QTensor without first calling TrackQTensor: %s '
-         '(all known = %r)') % (t_name, self._tracked_tensors.keys()))
-    eval_only = kwargs['eval_only'] if 'eval_only' in kwargs else False
-    qd = self._tracked_tensors[t_name]
+    if act_name not in self._act_name_to_qdomain_name:
+      raise ValueError(
+          f"The given act_name='{act_name}' must first be tracked using "
+          f'TrackQActs. Expected one of {self._act_name_to_qdomain_name.keys()}'
+      )
+    qd = self._GetQDomain(self._act_name_to_qdomain_name[act_name])
     if not qd:
-      return ts
-    return qd.QuantizeTensors(t_name, ts, eval_only=eval_only)
+      return act
+    else:
+      return qd.QuantizeAct(act_name, act, eval_only=eval_only)
 
-  def GetQTensorRange(self, t_name, ts):
-    """Returns the range for a quantized tensor.
-
-    t_name must have been previously create via TrackQTensor and t should be
-    previously quantized.
-
-    Args:
-      t_name: Preivously created QTensor t_name to fetch range from.
-      t: Tensor to retrieve range from.
-
-    Returns:
-      The (min, max) range of the quantized tensor.
-    """
-    qd = self._tracked_tensors[t_name]
-    return qd.GetTensorRange(t_name, ts)
-
-  def QWeight(self, w, domain='weight'):
+  def QWeight(self, w, domain: str = 'default'):
     """Quantizes a weight.
 
     Args:
       w: The weight tensor.
-      domain: Custom domain to match (defaults to 'weight' or 'default').
+      domain: Name of the QDomain to use for quantization.
     Returns:
       The weights quantized.
     """
-    qd = self.GetQDomain(domain)
+    qd = self._GetQDomain(domain)
     return qd.QuantizeWeight(w) if qd else w
 
-  def GetQDomain(self, domain):
+  def _ValidateArgName(self, op_arg_name: str, name: Optional[str]):
+    if name is not None and name not in self._all_names:
+      raise ValueError(
+          f"Expected {op_arg_name}='{name}' to be None or one of "
+          f'{self._all_names}. Use TrackQActs or TrackQWeight to create it')
+
+  def QMatmul(self,
+              lhs,
+              rhs,
+              *,
+              lhs_name: Optional[str] = None,
+              rhs_name: Optional[str] = None,
+              lhs_dist: QDistribution = QDistribution.SYMMETRIC,
+              rhs_dist: QDistribution = QDistribution.SYMMETRIC,
+              ensure2d: bool = False,
+              qdomain: str = 'default',
+              **op_kwargs):
+    self._ValidateArgName('lhs_name', lhs_name)
+    self._ValidateArgName('rhs_name', rhs_name)
+    qd = self._GetQDomain(qdomain)
+    if qd is None:
+      if ensure2d:
+        return py_utils.Matmul(lhs, rhs, **op_kwargs)
+      else:
+        return tf.matmul(lhs, rhs, **op_kwargs)
+    else:
+      return qd.QMatmul(
+          lhs,
+          rhs,
+          lhs_name=lhs_name,
+          rhs_name=rhs_name,
+          lhs_dist=lhs_dist,
+          rhs_dist=rhs_dist,
+          ensure2d=ensure2d,
+          **op_kwargs)
+
+  def QConv1D(self,
+              inputs,
+              filters,
+              strides,
+              padding,
+              *,
+              inputs_name: Optional[str] = None,
+              filters_name: Optional[str] = None,
+              inputs_dist: QDistribution = QDistribution.SYMMETRIC,
+              filters_dist: QDistribution = QDistribution.SYMMETRIC,
+              qdomain: str = 'default',
+              **op_kwargs):
+    self._ValidateArgName('inputs_name', inputs_name)
+    self._ValidateArgName('filters_name', filters_name)
+    qd = self._GetQDomain(qdomain)
+    if qd is None:
+      return tf.nn.conv1d(inputs, filters, strides, padding, **op_kwargs)
+    else:
+      return qd.QConv1D(
+          inputs,
+          filters,
+          strides,
+          padding,
+          inputs_name=inputs_name,
+          filters_name=filters_name,
+          inputs_dist=inputs_dist,
+          filters_dist=filters_dist,
+          **op_kwargs)
+
+  def QConv2D(self,
+              inputs,
+              filters,
+              strides,
+              padding,
+              *,
+              inputs_name: Optional[str] = None,
+              filters_name: Optional[str] = None,
+              inputs_dist: QDistribution = QDistribution.SYMMETRIC,
+              filters_dist: QDistribution = QDistribution.SYMMETRIC,
+              is_depthwise: bool = False,
+              qdomain: str = 'default',
+              **op_kwargs):
+    self._ValidateArgName('inputs_name', inputs_name)
+    self._ValidateArgName('filters_name', filters_name)
+    qd = self._GetQDomain(qdomain)
+    if qd is None:
+      if is_depthwise:
+        return tf.nn.depthwise_conv2d(inputs, filters, strides, padding,
+                                      **op_kwargs)
+      return tf.nn.conv2d(inputs, filters, strides, padding, **op_kwargs)
+    else:
+      return qd.QConv2D(
+          inputs,
+          filters,
+          strides,
+          padding,
+          inputs_name=inputs_name,
+          filters_name=filters_name,
+          inputs_dist=inputs_dist,
+          filters_dist=filters_dist,
+          is_depthwise=is_depthwise,
+          **op_kwargs)
+
+  def QEinsum(self,
+              equation,
+              lhs,
+              rhs,
+              *,
+              lhs_name: Optional[str] = None,
+              rhs_name: Optional[str] = None,
+              lhs_dist: QDistribution = QDistribution.SYMMETRIC,
+              rhs_dist: QDistribution = QDistribution.SYMMETRIC,
+              qdomain: str = 'default',
+              **einsum_kwargs):
+    self._ValidateArgName('lhs_name', lhs_name)
+    self._ValidateArgName('rhs_name', rhs_name)
+    qd = self._GetQDomain(qdomain)
+    if qd is None:
+      return tf.einsum(equation, lhs, rhs, **einsum_kwargs)
+    else:
+      return qd.QEinsum(
+          equation,
+          lhs,
+          rhs,
+          lhs_name=lhs_name,
+          rhs_name=rhs_name,
+          lhs_dist=lhs_dist,
+          rhs_dist=rhs_dist,
+          **einsum_kwargs)
+
+  def _ValidateWeight(self, w_name, w=None):
+    if w_name not in self._weight_name_to_qdomain_name:
+      raise ValueError(
+          f"The given w_name='{w_name}' must first be tracked using "
+          'TrackQWeight. Expected one of '
+          f'{self._weight_name_to_qdomain_name.keys()}')
+
+    # If w is a variable on this layer, then validate that w_name matches the
+    # name given to w in self.CreateVariable.
+    if w is not None and hasattr(w, 'ref') and w.ref() in self.vars:
+      expected_name = w.name.split('/')[-2]  # model/path/layer/weight/var:0
+      if w_name != expected_name:
+        raise ValueError(
+            f'Expected the AQT weight name to match the name of non-AQT '
+            f"weight, but got '{w_name}' and '{expected_name}'."
+            f'\nFull weight info:\n  {w}')
+
+  def ToAqtWeight(self, w_name, w, feature_axis, expected_scale_shape=None):
+    """Quantized integer weight AQT style.
+
+    This only scales, rounds and clips; resulting quantized weight would be
+    either integer or integer emulated in float.
+
+    w_name must have been previously created via TrackQWeight.
+
+    Args:
+      w_name: Previously created w_name QWeight to quantize weight.
+      w: The weight tensor.
+      feature_axis: axis corresponding to output channel/feature for weights.
+      expected_scale_shape: Optional shape to verify if scale shape is expected.
+        Defaults to None.
+
+    Returns:
+      Quantized weights.
+    """
+    self._ValidateWeight(w_name, w)
+    qd = self._GetQDomain(self._weight_name_to_qdomain_name[w_name])
+    if not qd:
+      return w
+    return qd.ToAqtWeight(
+        w_name,
+        w,
+        feature_axis=feature_axis,
+        expected_scale_shape=expected_scale_shape)
+
+  def FromAqtWeight(self, w_name, out, merge_feature_axes=False):
+    """Rescales the output corresponding to AQT style quantized matmul's weight.
+
+    Uses the same scale used by `ToAqtWeight` and apply its inverse to rescale.
+
+    w_name must have been previously created via TrackQWeight.
+
+    Args:
+      w_name: Previously created w_name QWeight to quantize weight.
+      out: The tensor to rescale.
+      merge_feature_axes: whether or the feature axes have been reshaped into a
+        single axis in 'out'.
+
+    Returns:
+      Rescaled output.
+    """
+    self._ValidateWeight(w_name)
+    qd = self._GetQDomain(self._weight_name_to_qdomain_name[w_name])
+    return qd.FromAqtWeight(w_name, out) if qd else out
+
+  def ToAqtConv(self,
+                w_name,
+                act,
+                weight,
+                w_feature_axis,
+                act_distribution=QDistribution.SYMMETRIC,
+                w_expected_scale_shape=None):
+    """Quantizes Weights and activations for convolutions.
+
+    Refer to quantizable_layer.ToAqtConv.
+
+    Args:
+      w_name: Previously created w_name QWeight to quantize weight.
+      act: The activation tensor to quantize.
+      weight: The weight tensor to quantizes.
+      w_feature_axis: axis corresponding to output channel/feature for weights.
+      act_distribution: Distribution of act.
+      w_expected_scale_shape: Optional shape to verify if scale shape is
+        expected. Defaults to None.
+
+    Returns:
+      Quantized act and weight.
+    """
+    self._ValidateWeight(w_name, weight)
+    qd = self._GetQDomain(self._weight_name_to_qdomain_name[w_name])
+    if not qd:
+      return act, weight
+    return qd.ToAqtConv(
+        w_name,
+        act=act,
+        weight=weight,
+        act_distribution=act_distribution,
+        w_feature_axis=w_feature_axis,
+        w_expected_scale_shape=w_expected_scale_shape)
+
+  def FromAqtConv(self, w_name, output, *, is_depthwise=False):
+    """Rescales the output corresponding to AQT quantized convolution.
+
+    Refer to quantizable_layer.FromAqtConv.
+
+    Args:
+      w_name: weight name.
+      output: The tensor to rescale.
+      is_depthwise: Whether or not this follows a DepthwiseConv, which merges
+        the feature axes in the output tensor.
+
+    Returns:
+      Rescaled output.
+    """
+    self._ValidateWeight(w_name)
+    qd = self._GetQDomain(self._weight_name_to_qdomain_name[w_name])
+    if qd is None:
+      return output
+    return qd.FromAqtConv(w_name, output, is_depthwise=is_depthwise)
+
+  def ToAqtInputs(self,
+                  w_name,
+                  act,
+                  weight,
+                  w_feature_axis,
+                  act_distribution=QDistribution.SYMMETRIC,
+                  w_expected_scale_shape=None):
+    """Quantizes weights and activations for (act * w) matmul AQT style.
+
+    This only scales, rounds and clips; resulting quantized inputs would be
+    either integer ot integer emulated in float.
+
+    w_name must have been previously created via TrackQWeight.
+
+    Args:
+      w_name: Previously created w_name QWeight to quantize weight.
+      act: The activation tensor to quantize.
+      weight: The weight tensor to quantizes.
+      w_feature_axis: axis corresponding to output channel/feature for weights.
+      act_distribution: Distribution of act.
+      w_expected_scale_shape: Optional shape to verify if scale shape is
+        expected. Defaults to None.
+
+    Returns:
+      Quantized act and weight.
+    """
+    self._ValidateWeight(w_name, weight)
+    qd = self._GetQDomain(self._weight_name_to_qdomain_name[w_name])
+    if not qd:
+      return act, weight
+    return qd.ToAqtInputs(
+        w_name,
+        act=act,
+        weight=weight,
+        act_distribution=act_distribution,
+        w_feature_axis=w_feature_axis,
+        w_expected_scale_shape=w_expected_scale_shape)
+
+  def FromAqtMatmul(self, w_name, output):
+    """Rescales the output corresponding to AQT style quantized matmul.
+
+    Uses the same scales used by `ToAqtInputs` and apply its inverse to rescale.
+
+    w_name must have been previously created via TrackQWeight.
+
+    Args:
+      w_name: Previously created w_name QWeight to quantize weight.
+      output: The tensor to rescale.
+
+    Returns:
+      Rescaled output.
+    """
+    self._ValidateWeight(w_name)
+    qd = self._GetQDomain(self._weight_name_to_qdomain_name[w_name])
+    return qd.FromAqtMatmul(w_name, output) if qd else output
+
+  def ToAqtActActInputs(self,
+                        act_lhs,
+                        act_rhs,
+                        *,
+                        act_lhs_distribution=QDistribution.SYMMETRIC,
+                        act_rhs_distribution=QDistribution.SYMMETRIC,
+                        domain: str = 'default'):
+    """Quantizes activations for (act * act) matmul AQT style.
+
+    This only scales, rounds and clips; resulting quantized acts would be
+    either integer or integer emulated in float.
+
+    Args:
+      act_lhs: Left hand side activation.
+      act_rhs: Right hand side activation.
+      act_lhs_distribution: Distribution of act_lhs.
+      act_rhs_distribution: Distribution of act_rhs.
+      domain: Custom domain to match (defaults to 'default').
+
+    Returns:
+      Quantized activations corresponding to act_lhs and act_rhs.
+    """
+    qd = self._GetQDomain(domain)
+    if not qd:
+      return act_lhs, act_rhs
+
+    return qd.ToAqtActActInputs(
+        act_lhs=act_lhs,
+        act_rhs=act_rhs,
+        act_lhs_distribution=act_lhs_distribution,
+        act_rhs_distribution=act_rhs_distribution)
+
+  def FromAqtActActMatmul(self, output, domain: str = 'default'):
+    """Rescales the output of (act*act) matmul for AQT style quantized acts.
+
+    Args:
+      output: Previously created w_name QWeight to quantize weight.
+      domain: Custom domain to match (defaults to 'default').
+
+    Returns:
+      Rescaled output.
+    """
+    qd = self._GetQDomain(domain)
+    if not qd:
+      return output
+
+    return qd.FromAqtActActMatmul(output)
+
+  def _GetQDomain(self, domain: str):
     """Gets the QDomain matching a given domain name.
 
     Args:
       domain: User specified domain name.
+
     Returns:
       The requested QDomain, the 'default' QDomain or None.
     """
-    qd = self._qdomains.get(domain)
-    if qd:
+    qd = self._qdomains[domain]
+    if qd is not None:
       return qd
-    qd = self._qdomains.get('default')
-    return qd
+    else:
+      return self._qdomains['default']
+
+  def GetQDomainParams(self, domain: str):
+    """Gets domain's Params if they're set, and the default Params otherwise.
+
+    Args:
+      domain: User specified domain name.
+
+    Returns:
+      Params for the QDomain matching the requested domain name if they're set,
+      and params for the 'default' QDomain otherwise. Will return None if both
+      p.qdomain.domain and p.qdomain.default are None.
+    """
+    p = self.params
+    qdparams = p.qdomain.Get(domain)
+    if qdparams is None:
+      qdparams = p.qdomain.default
+    return qdparams
+
+  def QRAct(self, act, dist: QDistribution, domain: str = 'default'):
+    """Quantizes act according to its distribution."""
+    qd = self._GetQDomain(domain)
+    return act if qd is None else qd.QRAct(act, dist)
 
   def _AddQuantizationFunctions(self):
     """Adds standard quantization functions against the given layer."""
 
-    def WrapOp(fnname, f, default_qmin=None, default_qmax=None):
+    def WrapOp(op_name, op, dist=None):
       """Adds a wrapper op to the layer's fns."""
 
-      def Wrapped(*args, **kwargs):
+      def Wrapped(*op_args,
+                  qout_name=None,
+                  qdomain: str = 'default',
+                  **op_kwargs):
         """Wraps a native op."""
-        # Validate and pop args 'qt', 'qmin', 'qmax' and 'qdomain'.
-        qt = kwargs.get('qt')
-        if qt is not None:
-          del kwargs['qt']
-        qmin = kwargs.get('qmin')
-        if qmin is not None:
-          del kwargs['qmin']
-        qmax = kwargs.get('qmax')
-        if qmax is not None:
-          del kwargs['qmax']
-        qdomain = kwargs.get('qdomain')
-        if qdomain is not None:
-          del kwargs['qdomain']
-        narrow_to_asym_bit_depth = kwargs.get('narrow_to_asym_bit_depth')
-        if narrow_to_asym_bit_depth is not None:
-          del kwargs['narrow_to_asym_bit_depth']
-        if qmin is None:
-          qmin = default_qmin
-        if qmax is None:
-          qmax = default_qmax
-        assert qt is not None or (qmin is not None and qmax is not None), (
-            ('Quantized function "%s" requires either qt (QTensor name) or '
-             'qmin/qmax to be set.') % fnname)
+        if qout_name is None and dist is None:
+          raise ValueError(
+              f'Quantized op "{op_name}" requires qout_name to be set.')
 
         # Provide a better default name if none provided.
-        if 'name' not in kwargs and qt is not None:
-          kwargs['name'] = '%s_%s' % (fnname, qt)
+        if 'name' not in op_kwargs and qout_name is not None:
+          op_kwargs['name'] = '%s_%s' % (op_name, qout_name)
 
         # Invoke original.
-        y = f(*args, **kwargs)
+        y = op(*op_args, **op_kwargs)
 
         # Handle the output.
-        if qt is not None:
-          y = self.QTensor(qt, y)
+        if qout_name is not None:
+          y = self.QAct(qout_name, y)
         else:
-          qd = self.GetQDomain(qdomain)
-          if qd:
-            if narrow_to_asym_bit_depth:
-              qrange = qmax - qmin
-              qmax = qmin + qrange * (2**qd.bits - 1) / (2**qd.bits)
-            y = qd.QuantizeNaturalRange(y, qmin, qmax)
+          y = self.QRAct(y, dist, qdomain)  # pytype: disable=wrong-arg-types  # dynamic-method-lookup
         return y
 
-      self.AddFunction(fnname, Wrapped)
+      self.AddFunction(op_name, Wrapped)
 
-    # Supported quantized functions.
+    # Quantize output activations based on tracked tensors.
     WrapOp('qadd', tf.add)
     WrapOp('qsubtract', tf.subtract)
     WrapOp('qmultiply', tf.multiply)
+    WrapOp('qlog', tf.math.log)
+
+    # TODO(shivaniagrawal): delete the following wrappers, as they are
+    # duplicated with self.QMatmul, self.QConv.
     WrapOp('qmatmul', py_utils.Matmul)
     WrapOp('qbatchmatmul', tf.matmul)
     WrapOp('qconv1d', tf.nn.conv1d)
-    WrapOp('qtanh', tf.tanh, default_qmin=-1.0, default_qmax=1.0)
-    WrapOp('qsigmoid', tf.sigmoid, default_qmin=0.0, default_qmax=1.0)
-    WrapOp('qsoftmax', tf.nn.softmax, default_qmin=0.0, default_qmax=1.0)
-    WrapOp('qlogsoftmax', tf.nn.log_softmax)
-    WrapOp('qrelu', tf.nn.relu)
-    WrapOp('qrelu6', tf.nn.relu6, default_qmin=0.0, default_qmax=6.0)
-    WrapOp(
-        'qrandom_uniform',
-        tf.random_uniform,
-        default_qmin=0.0,
-        default_qmax=1.0)
 
-    # Convenience for quantizing weights.
-    self.AddFunction('qweight', self.QWeight)
+    # Quantizing activations based on distribution
+    WrapOp('qtanh', tf.tanh, dist=QDistribution.TANH)
+    WrapOp('qsigmoid', tf.sigmoid, dist=QDistribution.SIGMOID)
+    WrapOp('qsoftmax', tf.nn.softmax, dist=QDistribution.SOFTMAX)
+    WrapOp('qlogsigmoid', tf.math.log_sigmoid, dist=QDistribution.LOG_SOFTMAX)
+    WrapOp('qlogsoftmax', tf.nn.log_softmax, dist=QDistribution.LOG_SOFTMAX)
+    WrapOp('qrelu', tf.nn.relu, dist=QDistribution.RELU)
+    WrapOp('qrelu6', tf.nn.relu6, dist=QDistribution.RELU6)
+    WrapOp(
+        'qrandom_uniform', tf.random.uniform, dist=QDistribution.RANDOM_UNIFORM)
+
+
+class QDomain(base_layer.BaseLayer):
+  """Base class for a quantization domain layer.
+
+  This implementation doubles as a no-op quantization domain.
+  """
+
+  def __init__(self, params):
+    super().__init__(params)
+    self.all_names = set()
+    self.act_names = set()
+    self.weight_names = set()
+
+  @property
+  def bits(self):
+    """Retrieves the bits used by this quantization layer.
+
+    Returns:
+      The number of bits available to this qdomain or None if unquantized.
+    """
+    return None
+
+  def QuantizeWeight(self, w):
+    """Quantizes a weight.
+
+    Args:
+      w: Weight tensor to quantize.
+
+    Returns:
+      Quantized weight.
+    """
+    return w
+
+  def QRAct(self, act, dist: QDistribution):
+    del dist
+    return act
+
+  def QMatmul(
+      self,
+      lhs,
+      rhs,
+      *,
+      lhs_name: Optional[str] = None,
+      rhs_name: Optional[str] = None,
+      lhs_dist: QDistribution = QDistribution.SYMMETRIC,
+      rhs_dist: QDistribution = QDistribution.SYMMETRIC,
+      out_name: Optional[str] = None,
+      ensure2d: bool = False,
+      **op_kwargs,
+  ):
+    del lhs_name, rhs_name, lhs_dist, rhs_dist, out_name
+    if ensure2d:
+      return py_utils.Matmul(lhs, rhs, **op_kwargs)
+    return tf.matmul(lhs, rhs, **op_kwargs)
+
+  def QConv1D(self,
+              inputs,
+              filters,
+              strides,
+              padding,
+              *,
+              inputs_name: Optional[str],
+              filters_name: Optional[str],
+              inputs_dist: QDistribution = QDistribution.SYMMETRIC,
+              filters_dist: QDistribution = QDistribution.SYMMETRIC,
+              **op_kwargs):
+    del inputs_name, filters_name, inputs_dist, filters_dist
+    return tf.nn.conv1d(inputs, filters, strides, padding, **op_kwargs)
+
+  def QConv2D(self,
+              inputs,
+              filters,
+              strides,
+              padding,
+              *,
+              inputs_name: Optional[str],
+              filters_name: Optional[str],
+              inputs_dist: QDistribution = QDistribution.SYMMETRIC,
+              filters_dist: QDistribution = QDistribution.SYMMETRIC,
+              is_depthwise: bool = False,
+              **op_kwargs):
+    del inputs_name, filters_name, inputs_dist, filters_dist
+    if is_depthwise:
+      return tf.nn.depthwise_conv2d(inputs, filters, strides, padding,
+                                    **op_kwargs)
+    return tf.nn.conv2d(inputs, filters, strides, padding, **op_kwargs)
+
+  def QEinsum(
+      self,
+      equation,
+      lhs,
+      rhs,
+      *,
+      lhs_name: Optional[str] = None,
+      rhs_name: Optional[str] = None,
+      lhs_dist: QDistribution = QDistribution.SYMMETRIC,
+      rhs_dist: QDistribution = QDistribution.SYMMETRIC,
+      **einsum_kwargs,
+  ):
+    del lhs_name, rhs_name, lhs_dist, rhs_dist
+    return tf.einsum(equation, lhs, rhs, **einsum_kwargs)
+
+  def ToAqtConv(self,
+                w_name,
+                act,
+                weight,
+                w_feature_axis,
+                act_distribution=QDistribution.SYMMETRIC,
+                w_expected_scale_shape=None):
+    """Quantizes Weights and activations for convolutions.
+
+    Refer to quantizable_layer.ToAqtConv.
+
+    Args:
+      w_name: Previously created w_name QWeight to quantize weight.
+      act: The activation tensor to quantize.
+      weight: The weight tensor to quantizes.
+      w_feature_axis: axis corresponding to output channel/feature for weights.
+      act_distribution: Distribution of act.
+      w_expected_scale_shape: Optional shape to verify if scale shape is
+        expected. Defaults to None.
+
+    Returns:
+      Quantized act and weight.
+    """
+    del w_feature_axis, w_expected_scale_shape, w_name, act_distribution
+    return act, weight
+
+  def FromAqtConv(self, w_name, output, *, is_depthwise=False):
+    """Rescales the output corresponding to AQT quantized convolution.
+
+    Refer to quantizable_layer.FromAqtConv.
+
+    Args:
+      w_name: weight name.
+      output: The tensor to rescale.
+      is_depthwise: Whether or not this follows a DepthwiseConv, which merges
+        the feature axes in the output tensor.
+
+    Returns:
+      Rescaled output.
+    """
+    del w_name, is_depthwise
+    return output
+
+  def ToAqtInputs(self,
+                  w_name,
+                  act,
+                  weight,
+                  w_feature_axis,
+                  act_distribution=QDistribution.SYMMETRIC,
+                  w_expected_scale_shape=None):
+    """Quantizes weights and activations for (act * w) matmul AQT style.
+
+    Refer to quantizable_layer.ToAqtInputs.
+
+    Args:
+      w_name: Previously created w_name QWeight to quantize weight.
+      act: The activation tensor to quantize.
+      weight: The weight tensor to quantizes.
+      w_feature_axis: axis corresponding to output channel/feature for weights.
+      act_distribution: Distribution of act.
+      w_expected_scale_shape: Optional shape to verify if scale shape is
+        expected. Defaults to None.
+
+    Returns:
+      Quantized act and weight.
+    """
+    del w_feature_axis, w_expected_scale_shape, w_name, act_distribution
+    return act, weight
+
+  def FromAqtMatmul(self, w_name, output):
+    """Rescales the output corresponding to AQT quantized matmuls.
+
+    Refer to quantizable_layer.FromAqtOutput.
+
+    Args:
+      w_name: weight name.
+      output: The tensor to rescale.
+
+    Returns:
+      Rescaled output.
+    """
+    del w_name
+    return output
+
+  def ToAqtWeight(self, w_name, w, feature_axis, expected_scale_shape):
+    """Quantized weight AQT style.
+
+    Refer to quantizable_layer.ToAqtWeight.
+
+    Args:
+      w_name: weight name.
+      w: The weight tensor.
+      feature_axis: axis corresponding to output channel/feature for weights.
+      expected_scale_shape: Optional shape to verify if scale shape is expected.
+
+    Returns:
+      Quantized weights.
+    """
+    del feature_axis, expected_scale_shape, w_name
+    return w
+
+  def FromAqtWeight(self, w_name, out, merge_feature_axes=False):
+    """Rescales the output corresponding to AQT quantized matmuls' weight.
+
+    Refer to quantizable_layer.FromAqtWeight.
+
+    Args:
+      w_name: weight name.
+      out: The tensor to rescale.
+      merge_feature_axes: whether or the feature axes have been reshaped into a
+        single axis in 'out'.
+
+    Returns:
+      Rescaled output.
+    """
+    del w_name
+    return out
+
+  def ToAqtActActInputs(self,
+                        act_lhs,
+                        act_rhs,
+                        act_lhs_distribution=QDistribution.SYMMETRIC,
+                        act_rhs_distribution=QDistribution.SYMMETRIC):
+    """Quantizes activations for (act * act) matmul AQT style.
+
+    This only scales, rounds and clips; resulting quantized acts would be
+    either integer or integer emulated in float.
+
+    Args:
+      act_lhs: Left hand side activation.
+      act_rhs: Right hand side activation.
+      act_lhs_distribution: Distribution of act_lhs.
+      act_rhs_distribution: Distribution of act_rhs.
+
+    Returns:
+      Quantized activations corresponding to act_lhs and act_rhs.
+    """
+    del act_lhs_distribution, act_rhs_distribution
+    return act_lhs, act_rhs
+
+  def FromAqtActActMatmul(self, output):
+    """Rescales output of dynamic matmul (act * act).
+
+    Args:
+      output: output, corresponds to tf.matmul(act_lhs, act_rhs)
+
+    Returns:
+      Rescaled output.
+    """
+    return output
+
+  def QuantizeConstantRange(self, t, min_value, max_value):
+    """Quantizes a true-constant range that is not used for arithmetic.
+
+    This supports special values like padding that should have a precise
+    range that we do not deviate from.
+
+    Args:
+      t: Tensor to quantize.
+      min_value: Min of the range.
+      max_value: Max of the range.
+
+    Returns:
+      Quantized tensor.
+    """
+    return t
+
+  def QuantizeNaturalRange(self, t, min_value, max_value):
+    """Quantizes a tensor with a known, natural range.
+
+    Args:
+      t: Tensor to quantize.
+      min_value: Min value of the range.
+      max_value: Max value of the range.
+
+    Returns:
+      Quantized tensor.
+    """
+    return t
+
+  def TrackQActs(self,
+                 *act_names: str,
+                 shape: Optional[Iterable[int]] = None,
+                 feature_axes: Optional[Iterable[int]] = None):
+    """Tracks activations and creates variables for quantization as needed."""
+    for act_name in act_names:
+      if act_name in self.all_names:
+        raise ValueError(
+            f"act_name '{act_name}' is already tracked for this qdomain.")
+      self.all_names.add(act_name)
+      self.act_names.add(act_name)
+
+  def TrackQWeight(
+      self,
+      weight_name,
+      shape,
+      feature_axis,
+      tensor_split_dims_mapping=None,
+      device_mesh=None,
+      legacy_aqt_weight_name=None,
+  ):
+    """Creates a QWeight with weight_name and given shape.
+
+    Args:
+      weight_name: Unique name (within layer) for this weight.
+      shape: Expected shape of the weight.
+      feature_axis: axis corresponding to output channel/feature for weights.
+      tensor_split_dims_mapping: A list of integers that map each tensor axis to
+        the device mesh axis along which it is sharded.
+      device_mesh: A numpy.ndarray describing the topology of a device mesh to
+        partition the created variable onto.
+      legacy_aqt_weight_name: Used for compatibility with old checkpoints.
+    """
+    if weight_name in self.all_names:
+      raise ValueError(
+          f"weight_name '{weight_name}' is already tracked for this qdomain.")
+    self.all_names.add(weight_name)
+    self.weight_names.add(weight_name)
+
+  def QuantizeAct(self, act_name: str, act: tf.Tensor, eval_only: bool = False):
+    """Quantizes a tensor with act_name previously created with TrackQActs.
+
+    Args:
+      act_name: Activation name.
+      act: Activations to quantize.
+      eval_only: Whether to only apply quantization pressure at eval time.
+
+    Returns:
+      Quantized tensor.
+    """
+    return act
+
+
+class FakeQDomain(QDomain):
+  """Base for QDomains using tf.quantization.fake_quant_with_*."""
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.Define('narrow_to_asym_bit_depth', True,
+             "Match TFLite's softmax and tanh bound calculations.")
+    p.Define(
+        'log_softmax_range', None,
+        'Manual range for quantizing logsoftmax activations. Should be '
+        'None or a sequence of two numbers.')
+    return p
+
+  def __init__(self, params):
+    super().__init__(params)
+    p = self.params
+    if not (p.log_softmax_range is None or len(p.log_softmax_range) == 2):
+      raise ValueError(f'p.log_softmax_range={p.log_softmax_range} should be '
+                       'None or a sequence of two numbers')
+
+  def _MaybeNarrowToAsymBitDepth(self, qmin, qmax):
+    if self.params.narrow_to_asym_bit_depth:
+      qrange = qmax - qmin
+      qmax = qmin + qrange * (2**self.bits - 1) / (2**self.bits)  # pytype: disable=unsupported-operands
+    return qmin, qmax
+
+  def QRAct(self, act, dist: QDistribution):
+    p = self.params
+    if dist == QDistribution.LOG_SOFTMAX:
+      if p.log_softmax_range is None:
+        raise ValueError(
+            'p.log_softmax_range must be set when using fns.qlogsoftmax '
+            'without qout_name or QRAct(..., dist=QDistribution.LOG_SOFTMAX)')
+      qmin, qmax = p.log_softmax_range
+      return self.QuantizeNaturalRange(act, qmin, qmax)
+    if dist == QDistribution.PADDING:
+      return self.QuantizeConstantRange(act, 0.0, 1.0)
+    elif dist == QDistribution.RELU:
+      return self.QuantizeNaturalRange(act, 0.0, 1.0)
+    elif dist == QDistribution.RELU6:
+      return self.QuantizeNaturalRange(act, 0.0, 6.0)
+    elif dist == QDistribution.SIGMOID:
+      return self.QuantizeNaturalRange(act, 0.0, 1.0)
+    elif dist == QDistribution.SOFTMAX:
+      qmin, qmax = self._MaybeNarrowToAsymBitDepth(0.0, 1.0)
+      return self.QuantizeNaturalRange(act, qmin, qmax)
+    elif dist == QDistribution.TANH:
+      qmin, qmax = self._MaybeNarrowToAsymBitDepth(-1.0, 1.0)
+      return self.QuantizeNaturalRange(act, qmin, qmax)
+    elif dist == QDistribution.RANDOM_UNIFORM:
+      return self.QuantizeNaturalRange(act, 0.0, 1.0)
+    else:
+      raise ValueError(f'cannot quantize act with dist={dist} to know range')
 
 
 class BaseClippingCapSchedule(base_layer.BaseLayer):
   """Base class for clipping cap schedules."""
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(BaseClippingCapSchedule, self).__init__(params)
 
   @property
   def is_quantized(self):
@@ -486,7 +1248,7 @@ class LinearClippingCapSchedule(BaseClippingCapSchedule):
 
   @classmethod
   def Params(cls):
-    p = super(LinearClippingCapSchedule, cls).Params()
+    p = super().Params()
     p.Define('start_step', 0,
              'We start gradually narrowing clipping cap from start_step.')
     p.Define('end_step', 15000,
@@ -502,17 +1264,6 @@ class LinearClippingCapSchedule(BaseClippingCapSchedule):
     p.name = 'CCSchedule'
     return p
 
-  @base_layer.initializer
-  def __init__(self, params):
-    super(LinearClippingCapSchedule, self).__init__(params)
-    p = self.params
-    cap_pc = py_utils.WeightParams(
-        shape=[],
-        init=py_utils.WeightInit.Constant(p.start_cap),
-        dtype=tf.float32,
-        collections=[self.__class__.__name__ + '_vars'])
-    self.CreateVariable('cap', cap_pc, trainable=False)
-
   @property
   def is_quantized(self):
     return False
@@ -521,7 +1272,7 @@ class LinearClippingCapSchedule(BaseClippingCapSchedule):
     return tf.clip_by_value(x, min_value, max_value)
 
   def GetState(self, theta):
-    return self.CurrentCap(theta)
+    return self._Value()
 
   def ApplyClippingWithState(self, state, x):
     """Applies clipping to x.
@@ -545,39 +1296,21 @@ class LinearClippingCapSchedule(BaseClippingCapSchedule):
     """
     return (-self.params.end_cap, self.params.end_cap)
 
-  def CurrentCap(self, theta):
-    """Returns the current clipping cap value."""
-    return tf.stop_gradient(theta.cap)
-
-  def Value(self, current_step):
-    """Returns the current clipping cap.
-
-    Args:
-      current_step: The current global step value.
-
-    Returns:
-      Returns the current clipping cap value given the current training
-      global step.
-    """
+  def _Value(self):
+    """Returns the current clipping cap."""
     p = self.params
     start_step = tf.cast(p.start_step, tf.float32)
     end_step = tf.cast(p.end_step, tf.float32)
-    current_step = tf.cast(current_step, tf.float32)
+    current_step = tf.cast(py_utils.GetGlobalStep(), tf.float32)
     steps_ratio = (
         tf.minimum(end_step - start_step, current_step - start_step)/
         (end_step - start_step))
     rmax_tensor = (
         steps_ratio * p.end_cap + (1.0 - steps_ratio) * p.start_cap)
-    return tf.cond(tf.less(current_step, p.start_step),
-                   lambda: tf.to_float(p.start_cap),
-                   lambda: tf.to_float(rmax_tensor))
-
-  def PostTrainingStepUpdate(self, global_step):
-    """Update the cap value."""
-    p = self.params
-    cap = self.Value(global_step)
-    summary_utils.scalar('cap', cap)
-    return self.vars.cap.assign(cap)
+    return tf.cond(
+        tf.less(current_step,
+                p.start_step), lambda: tf.cast(p.start_cap, tf.float32),
+        lambda: tf.cast(rmax_tensor, tf.float32))
 
 
 class FakeQuantizationSchedule(BaseClippingCapSchedule):
@@ -591,7 +1324,7 @@ class FakeQuantizationSchedule(BaseClippingCapSchedule):
 
   @classmethod
   def Params(cls):
-    p = super(FakeQuantizationSchedule, cls).Params()
+    p = super().Params()
     p.name = 'FQSchedule'
     p.Define('clip_start_step', 0,
              'We start gradually narrowing clipping cap from start_step.')
@@ -603,30 +1336,14 @@ class FakeQuantizationSchedule(BaseClippingCapSchedule):
     p.Define('bits', 8, 'Default quantized bit depth.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(FakeQuantizationSchedule, self).__init__(params)
+    super().__init__(params)
     p = self.params
     # We may relax this constraint at some point to allow gradual quantization
     # but enforce for now as it is easy to mess up and we have not evaluated
     # how it would work otherwise.
     assert p.quant_start_step >= p.clip_end_step, (
         'quant_start_step must be >= clip_end_step')
-    if not p.is_inference:
-      clip_ratio_pc = py_utils.WeightParams(
-          shape=[],
-          init=py_utils.WeightInit.Constant(-1.0
-                                            if p.clip_start_step > 0 else 0.0),
-          dtype=tf.float32,
-          collections=[self.__class__.__name__ + '_vars'])
-      self.CreateVariable('clip_ratio', clip_ratio_pc, trainable=False)
-      fq_ratio_pc = py_utils.WeightParams(
-          shape=[],
-          init=py_utils.WeightInit.Constant(-1.0
-                                            if p.quant_start_step > 0 else 0.0),
-          dtype=tf.float32,
-          collections=[self.__class__.__name__ + '_vars'])
-      self.CreateVariable('fq_ratio', fq_ratio_pc, trainable=False)
 
   @property
   def is_quantized(self):
@@ -680,11 +1397,27 @@ class FakeQuantizationSchedule(BaseClippingCapSchedule):
 
   def GetState(self, theta):
     """Gets the state from theta."""
-    if self.params.is_inference:
+    p = self.params
+    if p.is_inference:
       # State is not used for inference. Just return dummy.
       return tf.zeros([1], tf.float32)
     else:
-      return tf.stack([theta.clip_ratio, theta.fq_ratio])
+      # Calculations/vars need to be float but these can be ints in the params.
+      clip_end_step = tf.cast(p.clip_end_step, tf.float32)
+      clip_start_step = tf.cast(p.clip_start_step, tf.float32)
+      quant_start_step = tf.cast(p.quant_start_step, tf.float32)
+      global_step = tf.cast(py_utils.GetGlobalStep(), tf.float32)
+
+      # Will be negative if before clipping starts.
+      clip_ratio = (
+          tf.minimum(clip_end_step - clip_start_step,
+                     global_step - clip_start_step) /
+          tf.maximum(1.0, clip_end_step - clip_start_step))
+      # Currently fq is either on (1.0) or off (-1.0). Progressive quantization
+      # may later occupy 0..1.0.
+      fq_ratio = tf.where(global_step < quant_start_step, -1.0, 1.0)
+
+      return tf.stack([clip_ratio, fq_ratio])
 
   def _GetQuantizedRangeForCap(self, current_cap, bits):
     """Gets the range for the given cap and number of bits.
@@ -793,180 +1526,31 @@ class FakeQuantizationSchedule(BaseClippingCapSchedule):
     # return _CopyShape(x, Clipped())
     return _CopyShape(x, tf.where(fq_ratio <= 0.0, Clipped(), Quantized()))
 
-  def PostTrainingStepUpdate(self, global_step):
-    """Update the cap value."""
-    p = self.params
-    if p.is_inference:
-      return
 
-    # Calculations/vars need to be float but these can be ints in the params.
-    clip_end_step = tf.cast(p.clip_end_step, tf.float32)
-    clip_start_step = tf.cast(p.clip_start_step, tf.float32)
-    quant_start_step = tf.cast(p.quant_start_step, tf.float32)
-    global_step = tf.cast(global_step, tf.float32)
-
-    # Will be negative if before clipping starts.
-    new_clip_ratio = (
-        tf.minimum(clip_end_step - clip_start_step, global_step -
-                   clip_start_step) / (clip_end_step - clip_start_step))
-    # Currently fq is either on (1.0) or off (-1.0). Progressive quantization
-    # may later occupy 0..1.0.
-    new_fq_ratio = tf.where(global_step < quant_start_step, -1.0, 1.0)
-    return tf.group(
-        self.vars.clip_ratio.assign(new_clip_ratio),
-        self.vars.fq_ratio.assign(new_fq_ratio))
-
-
-class QDomain(base_layer.BaseLayer):
-  """Base class for a quantization domain layer.
-
-  This implementation doubles as a no-op quantization domain.
-  """
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(QDomain, self).__init__(params)
-    self._global_step_enabled = False
-
-  def _EnableGlobalStepAccess(self):
-    """Called by subclass init to initialize the global step counter.
-
-    Should be called from __init__ in an appropriate variable scope. Will add
-    a 'global_step' variable to the layer and a post step update to manage
-    it.
-    """
-    if self._global_step_enabled:
-      return
-    self._global_step_enabled = True
-    global_step_pc = py_utils.WeightParams(
-        shape=[],
-        init=py_utils.WeightInit.Constant(0),
-        dtype=tf.int64,
-        collections=[self.__class__.__name__ + '_vars'])
-    self.CreateVariable('global_step', global_step_pc, trainable=False)
-
-  @property
-  def bits(self):
-    """Retrieves the bits used by this quantization layer.
-
-    Returns:
-      The number of bits available to this qdomain or None if unquantized.
-    """
-    return None
-
-  def PostTrainingStepUpdate(self, global_step):
-    """Update the cap value."""
-    super_op = super(QDomain, self).PostTrainingStepUpdate(global_step)
-    if not self._global_step_enabled:
-      return super_op
-    return tf.group([
-        super_op,
-        self.vars.global_step.assign(global_step),
-    ])
-
-  def QuantizeWeight(self, w):
-    """Quantizes a weight.
-
-    Args:
-      w: Weight tensor to quantize.
-    Returns:
-      Quantized weight.
-    """
-    return w
-
-  def QuantizeConstantRange(self, t, min_value, max_value):
-    """Quantizes a true-constant range that is not used for arithmetic.
-
-    This supports special values like padding that should have a precise
-    range that we do not deviate from.
-
-    Args:
-      t: Tensor to quantize.
-      min_value: Min of the range.
-      max_value: Max of the range.
-    Returns:
-      Quantized tensor.
-    """
-    return t
-
-  def QuantizeNaturalRange(self, t, min_value, max_value):
-    """Quantizes a tensor with a known, natural range.
-
-    Args:
-      t: Tensor to quantize.
-      min_value: Min value of the range.
-      max_value: Max value of the range.
-    Returns:
-      Quantized tensor.
-    """
-    return t
-
-  def CreateTensor(self, t_name):
-    """Creates a QTensor with t_name.
-
-    Args:
-      t_name: Unique name (within layer) for this tensor.
-    """
-    pass
-
-  def QuantizeTensors(self, t_name, ts, eval_only=False):
-    """Quantizes a tensor with t_name previously created with CreateTensor.
-
-    If applicable, each of the passed tensors contributes to a shared
-    range.
-
-    Args:
-      t_name: Tensor name.
-      ts: List of tensors to quantize.
-      eval_only: Whether to only apply quantization pressure at eval time.
-    Returns:
-      Quantized tensors.
-    """
-    return ts
-
-  def GetTensorRange(self, t_name, ts):
-    """Retrieves the range of a tensor given the t_name used by CreateTensor.
-
-    Note, this computes the batch range across the list of tensors at training
-    time but fetches the stored tensor over time. This depends on
-    QuantizeTensors updating the appropriate value.
-
-    Args:
-      t_name: Tensor name.
-      ts: Tensor to determine the range for.
-
-    Returns:
-      A min-max pair that represents the tensor range.
-    """
-    raise NotImplementedError('Abstract method: NormalizeTensors')
-
-
-class SymetricScheduledClipQDomain(QDomain):
-  """A quantization domain that does symetric scheduled clipping.
+class SymmetricScheduledClipQDomain(FakeQDomain):
+  """A quantization domain that does symmetric scheduled clipping.
 
   This contains a BaseClippingCapSchedule which handles the actual clipping. It
   defaults to a FakeQuantizationSchedule.
 
   This clipping domain will aid in quantizing layers that are known to tolerate
   operation within known ranges (such as LSTM cells). The clipping range will
-  converge over a range of steps and is setup to match ideal, symetric ranges
+  converge over a range of steps and is setup to match ideal, symmetric ranges
   for quantized types.
   """
 
   @classmethod
   def Params(cls):
-    p = super(SymetricScheduledClipQDomain, cls).Params()
+    p = super().Params()
     p.Define('cc_schedule', FakeQuantizationSchedule.Params(),
              'Quantization clipping schedule.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(SymetricScheduledClipQDomain, self).__init__(params)
+    super().__init__(params)
     p = self.params
 
-    with tf.variable_scope(p.name):
-      self.CreateChild('cc_schedule', p.cc_schedule)
+    self.CreateChild('cc_schedule', p.cc_schedule)
 
   @property
   def bits(self):
@@ -978,7 +1562,7 @@ class SymetricScheduledClipQDomain(QDomain):
   def QuantizeNaturalRange(self, t, min_value, max_value):
     # Note: We apply the scheduled clip here, completely overriding the
     # known natural range. This is intentional and assumes that when this
-    # layer is used for symetric clipping, it is applied uniformly to all
+    # layer is used for symmetric clipping, it is applied uniformly to all
     # active elements.
     return self.cc_schedule.ApplyClipping(self.theta.cc_schedule, t)
 
@@ -988,13 +1572,11 @@ class SymetricScheduledClipQDomain(QDomain):
     # This is used for padding.
     return tf.clip_by_value(t, min_value, max_value)
 
-  def QuantizeTensors(self, t_name, ts, eval_only=False):
-    if eval_only and not self.params.is_eval:
-      return ts
+  def QuantizeAct(self, act_name, act, eval_only=False):
+    if eval_only and not self.do_eval:
+      return act
     else:
-      return [
-          self.cc_schedule.ApplyClipping(self.theta.cc_schedule, t) for t in ts
-      ]
+      return self.cc_schedule.ApplyClipping(self.theta.cc_schedule, act)
 
 
 class _CountedMinMaxAccumulator(base_layer.Accumulator):
@@ -1005,7 +1587,7 @@ class _CountedMinMaxAccumulator(base_layer.Accumulator):
   """
 
   def __init__(self, dtype):
-    super(_CountedMinMaxAccumulator, self).__init__()
+    super().__init__()
     self.dtype = dtype
 
   def DefaultValue(self):
@@ -1021,8 +1603,8 @@ class _CountedMinMaxAccumulator(base_layer.Accumulator):
     self.SetValue(state1)
 
 
-class PassiveAsymQDomain(QDomain):
-  """A quantization domain that does passive, asymetric quantization.
+class PassiveAsymQDomain(FakeQDomain):
+  """A quantization domain that does passive, asymmetric quantization.
 
   See: https://arxiv.org/abs/1712.05877
 
@@ -1033,7 +1615,7 @@ class PassiveAsymQDomain(QDomain):
 
   @classmethod
   def Params(cls):
-    p = super(PassiveAsymQDomain, cls).Params()
+    p = super().Params()
     p.Define('bits', 8, 'Default quantized bit depth.')
     p.Define('ema_decay', 0.99, 'Moving average decay.')
     p.Define('default_min', -1.0,
@@ -1049,20 +1631,16 @@ class PassiveAsymQDomain(QDomain):
         'This is often needed to allow the model to reach some level '
         'of convergence prior to applying quantization. Only affects '
         'training (not eval/inference).')
+    p.Define('freeze', False, 'Freeze quantization parameters')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(PassiveAsymQDomain, self).__init__(params)
-    p = self.params
+    super().__init__(params)
+    self._qvars = {}  # var_name -> tf.Variable
 
-    self._t_names = set()  # set of known t_name (from CreateTensor)
-    self._qvars = py_utils.NestedMap()  # var_name -> tf.Variable
-
+  def _CreateLayerVariables(self):
     # Save a scope for lazily created variables.
-    with tf.variable_scope(p.name + '/q'):
-      if p.delay_start_steps > 0:
-        self._EnableGlobalStepAccess()
+    with tf.variable_scope('q'):
       self._qvars_scope = tf.get_variable_scope()
 
   def _MaybeFakeQuant(self, inputs, min_v, max_v, num_bits):
@@ -1072,10 +1650,10 @@ class PassiveAsymQDomain(QDomain):
       return tf.quantization.fake_quant_with_min_max_vars(
           inputs, min_v, max_v, num_bits=num_bits)
 
-    if p.delay_start_steps != 0 and not p.is_eval:
+    if p.delay_start_steps != 0 and not self.do_eval:
       if p.delay_start_steps == -1:
         return inputs
-      return tf.where(self.theta.global_step >= p.delay_start_steps, Apply(),
+      return tf.where(py_utils.GetGlobalStep() >= p.delay_start_steps, Apply(),
                       inputs)
     else:
       return Apply()
@@ -1094,14 +1672,14 @@ class PassiveAsymQDomain(QDomain):
     w_min = tf.minimum(w_min, -p.quantize_weight_epsilon)
     w_max = tf.maximum(w_max, p.quantize_weight_epsilon)
     quant_w = self._MaybeFakeQuant(w, w_min, w_max, num_bits=p.bits)
-    if p.is_eval:
+    if self.do_eval:
       return quant_w
     else:
       # If quantizing during training, skip quantization if it produces
       # NANs. Sometimes early in the training process, things are unstable
       # and ranges can produce numerical instability that makes it
       # impossible to perform a fake_quant.
-      quant_w_has_nans = tf.is_nan(quant_w)
+      quant_w_has_nans = tf.math.is_nan(quant_w)
       return tf.where(quant_w_has_nans, w, quant_w)
 
   def QuantizeNaturalRange(self, t, min_value, max_value):
@@ -1112,130 +1690,119 @@ class PassiveAsymQDomain(QDomain):
     p = self.params
     return self._MaybeFakeQuant(t, min_value, max_value, num_bits=p.bits)
 
-  def CreateTensor(self, t_name):
+  def TrackQActs(self,
+                 *act_names: str,
+                 shape: Optional[Iterable[int]] = None,
+                 feature_axes: Optional[Iterable[int]] = None):
+    super().TrackQActs(*act_names, shape=shape, feature_axes=feature_axes)
     p = self.params
-    assert t_name not in self._t_names, (
-        'QTensor already registered: %s' % t_name)
-    self._t_names.add(t_name)
+    for act_name in act_names:
+      # Create accumulator
+      accumulator_name = self._GetAccumulatorNameForTensor(act_name)
+      self.RegisterAccumulator(accumulator_name,
+                               _CountedMinMaxAccumulator(p.dtype))
+      # Register vars.
+      min_pc = py_utils.WeightParams(
+          (), py_utils.WeightInit.Constant(p.default_min), p.dtype)
+      max_pc = py_utils.WeightParams(
+          (), py_utils.WeightInit.Constant(p.default_max), p.dtype)
+      self._CreateQStateVar(act_name, 'min', min_pc)
+      self._CreateQStateVar(act_name, 'max', max_pc)
 
-    # Create accumulator
-    accumulator_name = self._GetAccumulatorNameForTensor(t_name)
-    self.RegisterAccumulator(accumulator_name,
-                             _CountedMinMaxAccumulator(p.dtype))
-    # Register vars.
-    min_pc = py_utils.WeightParams((),
-                                   py_utils.WeightInit.Constant(p.default_min),
-                                   p.dtype)
-    max_pc = py_utils.WeightParams((),
-                                   py_utils.WeightInit.Constant(p.default_max),
-                                   p.dtype)
-    self._CreateQStateVar(t_name, 'min', min_pc)
-    self._CreateQStateVar(t_name, 'max', max_pc)
-
-  def QuantizeTensors(self, t_name, ts, eval_only=False):
+  def QuantizeAct(self, act_name, act, eval_only=False):
     p = self.params
     # Always straddle a real zero point.
-    if p.is_eval:
+    if self.do_eval:
       # At eval/inference time, use the memorized range.
       # Important: Don't capture these variables in training mode so as to
       # avoid extra/unnecessary captures.
-      min_var = self._GetQStateVar(t_name, 'min')
-      max_var = self._GetQStateVar(t_name, 'max')
-      return [
-          self._MaybeFakeQuant(t, min_var, max_var, num_bits=p.bits) for t in ts
-      ]
+      min_var = self._GetQStateVar(act_name, 'min')
+      max_var = self._GetQStateVar(act_name, 'max')
+      return self._MaybeFakeQuant(act, min_var, max_var, num_bits=p.bits)
     else:
       # At training time, use the batch calculated min/max.
-      accumulator_name = self._GetAccumulatorNameForTensor(t_name)
-      # Calculate min/max for all tensors.
-      batch_min = 0.0
-      batch_max = 0.0
-      for t in ts:
-        batch_min = tf.minimum(tf.reduce_min(t), batch_min)
-        batch_max = tf.maximum(tf.reduce_max(t), batch_max)
+      accumulator_name = self._GetAccumulatorNameForTensor(act_name)
+      # Calculate min/max for this batch.
+      batch_min = tf.reduce_min(act)
+      batch_max = tf.reduce_max(act)
+      # NOTE: This QDomain was implemented such that batch_min <= 0.0 and
+      # batch_max >= 0.0 even if that is not the case in the input data.
+      batch_min = tf.minimum(batch_min, 0.0)
+      batch_max = tf.maximum(batch_max, 0.0)
 
       # New state.
       state1 = tf.stack([1.0, batch_min, batch_max])
       self.accumulators[accumulator_name].Update(state1)
 
       # Results.
-      ts_out = []
-      for i, t in enumerate(ts):
-        if eval_only:
-          # If only quantizing at eval time, still record ranges as above
-          # but don't quantize.
-          quant_t = t
-        else:
-          # If quantizing during training, skip quantization if it produces
-          # NANs. Sometimes early in the training process, things are unstable
-          # and ranges can produce numerical instability that makes it
-          # impossible to perform a fake_quant.
-          quant_t = self._MaybeFakeQuant(
-              t, batch_min, batch_max, num_bits=p.bits)
-          # TODO(laurenzo): Plumb quant_t_has_nans through state and report.
-          quant_t_has_nans = tf.is_nan(quant_t)
-          quant_t = tf.where(quant_t_has_nans, t, quant_t)
-        ts_out.append(quant_t)
-        summary_utils.histogram(
-            '%s/%s_%d' % (self._qvars_scope.name, t_name, i), t)
-      return ts_out
+      if eval_only:
+        # If only quantizing at eval time, still record ranges as above
+        # but don't quantize.
+        quant_act = act
+      else:
+        # If quantizing during training, skip quantization if it produces
+        # NANs. Sometimes early in the training process, things are unstable
+        # and ranges can produce numerical instability that makes it
+        # impossible to perform a fake_quant.
+        quant_act = self._MaybeFakeQuant(
+            act, batch_min, batch_max, num_bits=p.bits)
+        # TODO(laurenzo): Plumb quant_act_has_nans through state and report.
+        quant_act_has_nans = tf.math.is_nan(quant_act)
+        quant_act = tf.where(quant_act_has_nans, act, quant_act)
+      summary_utils.histogram(f'{self._qvars_scope.name}/{act_name}', act)
+      return quant_act
 
-  def GetTensorRange(self, t_name, ts):
-    p = self.params
-    # Always straddle a real zero point.
-    if p.is_eval:
-      # At eval/inference time, use the memorized range.
-      # Important: Don't capture these variables in training mode so as to
-      # avoid extra/unnecessary captures.
-      min_var = tf.stop_gradient(self._GetQStateVar(t_name, 'min'))
-      max_var = tf.stop_gradient(self._GetQStateVar(t_name, 'max'))
-      return (min_var, max_var)
-    # Calculate min/max for all tensors.
-    batch_min = tf.minimum(tf.reduce_min(ts), 0.0)
-    batch_max = tf.maximum(tf.reduce_max(ts), 0.0)
-    return (tf.stop_gradient(batch_min), tf.stop_gradient(batch_max))
-
-  def PostTrainingStepUpdate(self, global_step):
-    ops = [super(PassiveAsymQDomain, self).PostTrainingStepUpdate(global_step)]
-    for t_name in self._t_names:
-      ops.extend(self._RecordTensor(t_name))
-      self._SummarizeTensor(t_name)
+  def PostTrainingStepUpdate(self):
+    if self.params.freeze:
+      return super().PostTrainingStepUpdate()
+    ops = [super().PostTrainingStepUpdate()]
+    for act_name in self.act_names:
+      ops.extend(self._RecordTensor(act_name))
+      self._SummarizeTensor(act_name)
     return tf.group(ops)
 
-  def _CreateQStateVar(self, t_name, suffix, params):
-    name = t_name + '_' + suffix
-    assert name not in self._qvars, 'QState var already exists: %s' % (name,)
-    var_name = self._qvars_scope.name + '/' + name
-    with tf.variable_scope(py_utils.global_variable_scope):
-      _, v = py_utils.CreateVariable(var_name, params, trainable=False)
+  def _GetAccumulatorNameForTensor(self, act_name):
+    return f'qact_{act_name}'
+
+  def _GetQStateVarName(self, act_name, suffix):
+    return f'{act_name}_{suffix}'
+
+  def _CreateQStateVar(self, act_name, suffix, params):
+    name = self._GetQStateVarName(act_name, suffix)
+    assert name not in self._qvars, 'QState var already exists: %s' % name
+    var_name = f'{self._qvars_scope.name}/{name}'
+    with tf.variable_scope(py_utils.GetGlobalVariableScope()):
+      v = py_utils.CreateVariable(var_name, params, trainable=False)
     self._qvars[name] = v
+    # Track the qvars so that in TF2 mode the variables can be loaded properly
+    # from a checkpoint.
+    # We cannot use `_private_vars` because it will be compared against the
+    # model's `theta` variables.
+    self._other_vars_to_track_tf2[name] = v
     return v
 
-  def _GetAccumulatorNameForTensor(self, t_name):
-    return 'qtensor_' + t_name
-
-  def _GetQStateVar(self, t_name, suffix):
-    v = self._qvars[t_name + '_' + suffix]
+  def _GetQStateVar(self, act_name, suffix):
+    v = self._qvars[self._GetQStateVarName(act_name, suffix)]
     return v
 
-  def _SummarizeTensor(self, t_name):
-    min_var = self._GetQStateVar(t_name, 'min')
-    max_var = self._GetQStateVar(t_name, 'max')
+  def _SummarizeTensor(self, act_name):
+    min_var = self._GetQStateVar(act_name, 'min')
+    max_var = self._GetQStateVar(act_name, 'max')
     # foo/q/somet_min:0 -> foo/q/somet_min
     summary_name_min = min_var.name.split(':')[0]
     summary_name_max = max_var.name.split(':')[0]
     summary_utils.scalar(summary_name_min, min_var)
     summary_utils.scalar(summary_name_max, max_var)
 
-  def _RecordTensor(self, t_name):
+  def _RecordTensor(self, act_name):
     p = self.params
-    if p.is_eval:
+    if self.do_eval:
       return []
 
-    accumulator_name = self._GetAccumulatorNameForTensor(t_name)
+    accumulator_name = self._GetAccumulatorNameForTensor(act_name)
     accumulator = self.accumulators[accumulator_name]
-    min_var = self._GetQStateVar(t_name, 'min')
-    max_var = self._GetQStateVar(t_name, 'max')
+    min_var = self._GetQStateVar(act_name, 'min')
+    max_var = self._GetQStateVar(act_name, 'max')
 
     # Unpack state tensor.
     current_value = accumulator.GetValue()
@@ -1266,6 +1833,7 @@ class PassiveAsymQDomain(QDomain):
 
 
 def _CopyShape(from_t, to_t):
+  """Sets the shape of from_t to to_t."""
   if isinstance(from_t, tf.Tensor) and isinstance(to_t, tf.Tensor):
     to_t.set_shape(from_t.shape)
   return to_t

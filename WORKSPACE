@@ -1,21 +1,23 @@
 """Workspace file for lingvo."""
 
-load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
-load(
-    "//lingvo:repo.bzl",
-    "cc_tf_configure",
-    "lingvo_protoc_deps",
-    "lingvo_testonly_deps",
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("//lingvo:repo.bzl", "cc_tf_configure", "icu", "lingvo_protoc_deps", "lingvo_testonly_deps")
+
+http_archive(
+    name = "org_tensorflow",
+    strip_prefix = "tensorflow-2.13.0",
+    urls = ["https://github.com/tensorflow/tensorflow/archive/v2.13.0.zip"],
 )
 
-git_repository(
-    name = "subpar",
-    remote = "https://github.com/google/subpar",
-    tag = "1.3.0",
-)
+# This import (along with the org_tensorflow archive) is necessary to provide the devtoolset-9 toolchain
+load("@org_tensorflow//tensorflow/tools/toolchains/remote_config:configs.bzl", "initialize_rbe_configs")  # buildifier: disable=load-on-top
+
+initialize_rbe_configs()
 
 cc_tf_configure()
 
 lingvo_testonly_deps()
 
 lingvo_protoc_deps()
+
+icu()

@@ -15,10 +15,10 @@ limitations under the License.
 
 #include <vector>
 
+#include "absl/synchronization/mutex.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
-#include "lingvo/core/ops/mutex.h"
 
 namespace tensorflow {
 namespace lingvo {
@@ -31,7 +31,7 @@ class RandomPermutationSequenceOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("num", &num_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("batch", &batch_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("repeat", &repeat_));
-    int64 seed;
+    int64_t seed;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("seed", &seed));
     if (seed == 0) {
       std::random_device device("/dev/urandom");
@@ -42,7 +42,7 @@ class RandomPermutationSequenceOp : public OpKernel {
   }
 
   void Compute(OpKernelContext* ctx) override {
-    MutexLock l(&mu_);
+    absl::MutexLock l(&mu_);
     OP_REQUIRES(ctx, !ids_.empty() || repeat_,
                 errors::OutOfRange("Epoch ended."));
     if (ids_.empty()) Fill();
@@ -75,7 +75,7 @@ class RandomPermutationSequenceOp : public OpKernel {
   int32 batch_;
   bool repeat_;
 
-  Mutex mu_;
+  absl::Mutex mu_;
   std::mt19937 rnd_;
   std::vector<int32> ids_;
 

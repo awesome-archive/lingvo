@@ -14,12 +14,7 @@
 # ==============================================================================
 """Tests for multitask_model."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_input_generator
 from lingvo.core import base_layer
 from lingvo.core import base_model
@@ -27,15 +22,16 @@ from lingvo.core import base_model_params
 from lingvo.core import hyperparams
 from lingvo.core import multitask_model
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 
 
-class MultiTaskModelTest(tf.test.TestCase):
+class MultiTaskModelTest(test_utils.TestCase):
 
   class _TestTask(base_model.BaseTask):
 
     @classmethod
     def Params(cls):
-      p = super(MultiTaskModelTest._TestTask, cls).Params()
+      p = super().Params()
       p.name = 'test_task'
       p.encoder = base_layer.BaseLayer.Params()
       p.encoder.name = 'enc'
@@ -43,9 +39,8 @@ class MultiTaskModelTest(tf.test.TestCase):
       p.decoder.name = 'dec'
       return p
 
-    @base_layer.initializer
     def __init__(self, params):
-      super(MultiTaskModelTest._TestTask, self).__init__(params)
+      super().__init__(params)
       p = self.params
       if p.encoder:
         self.CreateChild('encoder', p.encoder)
@@ -61,7 +56,7 @@ class MultiTaskModelTest(tf.test.TestCase):
     p1 = MultiTaskModelTest._TestTask.Params()
     p1.encoder = None
 
-    p.input = base_model_params.MultiTaskModelParams.Train()
+    p.input = base_model_params.MultiTaskModelParams().Train()
     p.input.Define('p0', base_input_generator.BaseInputGenerator.Params(), '')
     p.input.Define('p1', base_input_generator.BaseInputGenerator.Params(), '')
     p.task_params = hyperparams.Params()
@@ -71,7 +66,7 @@ class MultiTaskModelTest(tf.test.TestCase):
     p.task_probs.Define('p0', 0.5, '')
     p.task_probs.Define('p1', 0.5, '')
 
-    model = p.cls(p)
+    model = p.Instantiate()
     self.assertEqual(model.p0.encoder, model.p1.encoder)
 
   def testSharedEncoderDecoderModel(self):
@@ -85,7 +80,7 @@ class MultiTaskModelTest(tf.test.TestCase):
     p1.encoder = None
     p1.decoder = None
 
-    p.input = base_model_params.MultiTaskModelParams.Train()
+    p.input = base_model_params.MultiTaskModelParams().Train()
     p.input.Define('p0', base_input_generator.BaseInputGenerator.Params(), '')
     p.input.Define('p1', base_input_generator.BaseInputGenerator.Params(), '')
     p.task_params = hyperparams.Params()
@@ -95,7 +90,7 @@ class MultiTaskModelTest(tf.test.TestCase):
     p.task_probs.Define('p0', 0.5, '')
     p.task_probs.Define('p1', 0.5, '')
 
-    model = p.cls(p)
+    model = p.Instantiate()
     self.assertEqual(model.p0.encoder, model.p1.encoder)
     self.assertEqual(model.p0.decoder, model.p1.decoder)
 
@@ -103,13 +98,12 @@ class MultiTaskModelTest(tf.test.TestCase):
 
     @classmethod
     def Params(cls):
-      p = super(MultiTaskModelTest._TestTaskWithVars, cls).Params()
+      p = super().Params()
       p.name = 'test_task'
       return p
 
-    @base_layer.initializer
-    def __init__(self, params):
-      super(MultiTaskModelTest._TestTaskWithVars, self).__init__(params)
+    def _CreateLayerVariables(self):
+      super()._CreateLayerVariables()
       pc = py_utils.WeightParams(shape=[10, 10], dtype=tf.float32)
       self.CreateVariable('weight', pc)
 
@@ -121,7 +115,7 @@ class MultiTaskModelTest(tf.test.TestCase):
     p0 = MultiTaskModelTest._TestTaskWithVars.Params()
     p1 = MultiTaskModelTest._TestTaskWithVars.Params()
 
-    p.input = base_model_params.MultiTaskModelParams.Train()
+    p.input = base_model_params.MultiTaskModelParams().Train()
     p.input.Define('p0', base_input_generator.BaseInputGenerator.Params(), '')
     p.input.Define('p1', base_input_generator.BaseInputGenerator.Params(), '')
 
@@ -133,11 +127,11 @@ class MultiTaskModelTest(tf.test.TestCase):
     p.task_probs.Define('p0', 0.5, '')
     p.task_probs.Define('p1', 0.5, '')
 
-    model = p.cls(p)
+    model = p.Instantiate()
     all_vars = model.vars
-    self.assertEqual('shared/weight/var:0', all_vars.p0.weight.name)
-    self.assertEqual('shared/weight/var:0', all_vars.p1.weight.name)
+    self.assertEqual('shared/test_task/weight/var:0', all_vars.p0.weight.name)
+    self.assertEqual('shared/test_task/weight/var:0', all_vars.p1.weight.name)
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()

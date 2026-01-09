@@ -1,13 +1,17 @@
-package(
-    default_visibility = ["//visibility:public"],
-)
+# buildifier: disable=same-origin-load
+load("//lingvo:lingvo.bzl", "pytype_strict_library")
+# Placeholder: load py_library
+# Placeholder: load py_test
 
-licenses(["notice"])  # Apache 2.0
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
 
 py_library(
     name = "frontend",
     srcs = ["frontend.py"],
     deps = [
+        "//lingvo:compat",
         "//lingvo/core:base_layer",
         "//lingvo/core:py_utils",
     ],
@@ -22,10 +26,12 @@ py_test(
     deps = [
         ":frontend",
         # Additional FFT kernels dependency.
-        # Implicit numpy dependency.
-        # Implicit tensorflow dependency.
+        #internal proto upb dep
+        "//lingvo:compat",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -33,13 +39,10 @@ py_library(
     name = "input_generator",
     srcs = ["input_generator.py"],
     deps = [
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:base_input_generator",
-        "//lingvo/core:base_layer",
+        "//lingvo/core:generic_input",
         "//lingvo/core:py_utils",
-        "//lingvo/core:tokenizers",
-        "//lingvo/core/ops:py_x_ops",
     ],
 )
 
@@ -48,11 +51,10 @@ py_test(
     srcs = ["input_generator_test.py"],
     deps = [
         ":input_generator",
+        #internal proto upb dep
+        "//lingvo:compat",
+        "//lingvo/core:test_utils",
         # Implicit numpy dependency.
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
-        "//lingvo/core:py_utils",
-        "//lingvo/core:test_helper",
     ],
 )
 
@@ -60,15 +62,15 @@ py_library(
     name = "encoder",
     srcs = ["encoder.py"],
     deps = [
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
-        "//lingvo/core:base_encoder",
+        "//lingvo:compat",
         "//lingvo/core:base_layer",
         "//lingvo/core:layers",
         "//lingvo/core:model_helper",
         "//lingvo/core:plot",
         "//lingvo/core:py_utils",
         "//lingvo/core:rnn_cell",
+        "//lingvo/core:rnn_layers",
+        "//lingvo/core:spectrum_augmenter",
         "//lingvo/core:summary_utils",
     ],
 )
@@ -78,10 +80,34 @@ py_test(
     srcs = ["encoder_test.py"],
     deps = [
         ":encoder",
-        # Implicit numpy dependency.
-        # Implicit tensorflow dependency.
+        #internal proto upb dep
+        "//lingvo:compat",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
+        # Implicit numpy dependency.
+    ],
+)
+
+pytype_strict_library(
+    name = "eos_normalization",
+    srcs = ["eos_normalization.py"],
+    deps = [
+        "//lingvo:compat",
+        "//lingvo/core:py_utils",
+        # Implicit numpy dependency.
+    ],
+)
+
+py_test(
+    name = "eos_normalization_test",
+    srcs = ["eos_normalization_test.py"],
+    deps = [
+        ":eos_normalization",
+        # Implicit absl.testing.parameterized dependency.
+        #internal proto upb dep
+        "//lingvo:compat",
+        "//lingvo/core:test_utils",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -89,6 +115,7 @@ py_library(
     name = "fusion",
     srcs = ["fusion.py"],
     deps = [
+        "//lingvo:compat",
         "//lingvo/core:base_layer",
         "//lingvo/core:layers",
         "//lingvo/core:py_utils",
@@ -100,9 +127,11 @@ py_library(
     name = "decoder_utils",
     srcs = ["decoder_utils.py"],
     deps = [
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:py_utils",
+        "//lingvo/core:symbolic",
+        "//lingvo/tasks/asr:levenshtein_distance",
+        # Implicit six dependency.
     ],
 )
 
@@ -110,8 +139,13 @@ py_test(
     name = "decoder_utils_test",
     srcs = ["decoder_utils_test.py"],
     deps = [
+        ":decoder",
         ":decoder_utils",
-        # Implicit tensorflow dependency.
+        #internal proto upb dep
+        "//lingvo:compat",
+        "//lingvo/core:rnn_cell",
+        "//lingvo/core:symbolic",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -130,19 +164,18 @@ py_library(
         ":contextualizer_base",
         ":decoder_utils",
         ":fusion",
-        # Implicit numpy dependency.
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:attention",
         "//lingvo/core:base_decoder",
-        "//lingvo/core:base_layer",
+        "//lingvo/core:cluster_factory",
         "//lingvo/core:layers",
         "//lingvo/core:plot",
         "//lingvo/core:py_utils",
         "//lingvo/core:recurrent",
         "//lingvo/core:rnn_cell",
         "//lingvo/core:summary_utils",
-        "//lingvo/core/ops:py_x_ops",
+        "//lingvo/core:symbolic",
+        # Implicit matplotlib dependency.
     ],
 )
 
@@ -154,12 +187,15 @@ py_test(
     deps = [
         ":decoder",
         # Implicit python proto dependency.
-        # Implicit numpy dependency.
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        #internal proto upb dep
+        "//lingvo:compat",
+        "//lingvo/core:cluster_factory",
+        "//lingvo/core:layers",
         "//lingvo/core:py_utils",
+        "//lingvo/core:symbolic",
         "//lingvo/core:test_utils",
         "//lingvo/core/ops:hyps_py_pb2",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -167,9 +203,25 @@ py_library(
     name = "model_test_input_generator",
     srcs = ["model_test_input_generator.py"],
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:base_input_generator",
         "//lingvo/core:py_utils",
+    ],
+)
+
+pytype_strict_library(
+    name = "decoder_metrics",
+    srcs = ["decoder_metrics.py"],
+    deps = [
+        ":decoder_utils",
+        ":eos_normalization",
+        ":metrics_calculator",
+        "//lingvo:compat",
+        "//lingvo/core:base_layer",
+        "//lingvo/core:metrics",
+        "//lingvo/core:py_utils",
+        "//lingvo/core:tokenizers",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -178,16 +230,14 @@ py_library(
     srcs = ["model.py"],
     deps = [
         ":decoder",
-        ":decoder_utils",
+        ":decoder_metrics",
         ":encoder",
         ":frontend",
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
-        "//lingvo/core:base_layer",
+        "//lingvo:compat",
         "//lingvo/core:base_model",
-        "//lingvo/core:lr_schedule",
-        "//lingvo/core:metrics",
+        "//lingvo/core:program_lib",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
         "//lingvo/tools:audio_lib",
     ],
 )
@@ -202,20 +252,34 @@ py_test(
         ":input_generator",
         ":model",
         ":model_test_input_generator",
-        # Implicit numpy dependency.
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        #internal proto upb dep
+        "//lingvo:compat",
         "//lingvo/core:base_layer",
         "//lingvo/core:cluster_factory",
-        "//lingvo/core:lr_schedule",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
         "//lingvo/core:summary_utils",
         "//lingvo/core:test_helper",
         "//lingvo/core:test_utils",
+        # Implicit numpy dependency.
     ],
 )
 
 filegroup(
     name = "wpm_files",
     srcs = ["wpm_16k_librispeech.vocab"],
+)
+
+pytype_strict_library(
+    name = "levenshtein_distance",
+    srcs = ["levenshtein_distance.py"],
+)
+
+pytype_strict_library(
+    name = "metrics_calculator",
+    srcs = ["metrics_calculator.py"],
+    deps = [
+        ":decoder_utils",
+        "//lingvo:compat",
+    ],
 )

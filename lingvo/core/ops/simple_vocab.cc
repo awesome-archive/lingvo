@@ -60,10 +60,12 @@ string IdsToStr(const std::vector<int32>& ids) {
 
 Status Vocab::Load(const string& vocab_glob, bool load_token_ids) {
   std::vector<string> vocab_filenames;
-  TF_CHECK_OK(Env::Default()->GetMatchingPaths(vocab_glob, &vocab_filenames))
-      << "Unable to match vocab pattern: " << vocab_glob;
-  CHECK_EQ(vocab_filenames.size(), 1)
-      << "Did not match exactly one file with pattern: " << vocab_glob;
+  TF_RETURN_IF_ERROR(
+      Env::Default()->GetMatchingPaths(vocab_glob, &vocab_filenames));
+  if (vocab_filenames.size() != 1) {
+    return errors::InvalidArgument(
+        "Did not match exactly one file with pattern: ", vocab_glob);
+  }
   const string& vocab_filename = vocab_filenames[0];
 
   debug::SetUpVocab(vocab_filename);
@@ -123,7 +125,7 @@ Status Vocab::Load(const std::vector<string>& lines, bool load_token_ids) {
   sow_id_ = TokenToId(sow_token());
   eow_id_ = TokenToId(eow_token());
   unk_id_ = TokenToId(unk_token());
-  return Status::OK();
+  return Status();
 }
 
 const char* Vocab::sos_token() const {
@@ -161,13 +163,13 @@ class VocabTokenToIdOp : public OpKernel {
     Tensor* id;
     OP_REQUIRES_OK(ctx, ctx->allocate_output("id", token->shape(), &id));
     if (token->dims() == 0) {
-      id->scalar<int32>()() = vocab_.TokenToId(token->scalar<string>()());
+      id->scalar<int32>()() = vocab_.TokenToId(token->scalar<tstring>()());
     } else {
       OP_REQUIRES(
           ctx, token->dims() == 1,
           errors::InvalidArgument("Input must be a scalar or 1D tensor."));
       for (int i = 0; i < token->dim_size(0); i++) {
-        id->vec<int32>()(i) = vocab_.TokenToId(token->vec<string>()(i));
+        id->vec<int32>()(i) = vocab_.TokenToId(token->vec<tstring>()(i));
       }
     }
   }
@@ -196,13 +198,13 @@ class VocabIdToTokenOp : public OpKernel {
     Tensor* token;
     OP_REQUIRES_OK(ctx, ctx->allocate_output("token", id->shape(), &token));
     if (id->dims() == 0) {
-      token->scalar<string>()() = vocab_.IdToToken(id->scalar<int32>()());
+      token->scalar<tstring>()() = vocab_.IdToToken(id->scalar<int32>()());
     } else {
       OP_REQUIRES(
           ctx, id->dims() == 1,
           errors::InvalidArgument("Input must be a scalar or 1D tensor."));
       for (int i = 0; i < id->dim_size(0); i++) {
-        token->vec<string>()(i) = vocab_.IdToToken(id->vec<int32>()(i));
+        token->vec<tstring>()(i) = vocab_.IdToToken(id->vec<int32>()(i));
       }
     }
   }
@@ -232,13 +234,13 @@ class TokenInVocabOp : public OpKernel {
     OP_REQUIRES_OK(ctx,
                    ctx->allocate_output("result", token->shape(), &result));
     if (token->dims() == 0) {
-      result->scalar<bool>()() = vocab_.InVocab(token->scalar<string>()());
+      result->scalar<bool>()() = vocab_.InVocab(token->scalar<tstring>()());
     } else {
       OP_REQUIRES(
           ctx, token->dims() == 1,
           errors::InvalidArgument("Input must be a scalar or 1D tensor."));
       for (int i = 0; i < token->dim_size(0); i++) {
-        result->vec<bool>()(i) = vocab_.InVocab(token->vec<string>()(i));
+        result->vec<bool>()(i) = vocab_.InVocab(token->vec<tstring>()(i));
       }
     }
   }

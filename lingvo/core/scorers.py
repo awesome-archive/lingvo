@@ -14,24 +14,13 @@
 # ==============================================================================
 """Helper classes for computing scores."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections
 import math
 import six
-from six.moves import range
-
-
-def _IsUnicode(s):
-  return isinstance(s, six.text_type)
 
 
 def _ToUnicode(line):
-  if not _IsUnicode(line):
-    return line.decode('utf-8')
-  return line
+  return six.ensure_text(line, 'utf-8')
 
 
 def _Tokenize(string):
@@ -43,7 +32,7 @@ def NGrams(lst, order):
   return (lst[i:i + order] for i in range(len(lst) - order + 1))
 
 
-class Unsegmenter(object):
+class Unsegmenter:
   """Un-segments (merges) segmented strings.
 
   Used to retain back the original surface form of strings that are encoded
@@ -52,7 +41,7 @@ class Unsegmenter(object):
   """
 
   _BPE_SEPARATOR = _ToUnicode('@@ ')
-  _WPM_SEPARATOR = _ToUnicode('\xe2\x96\x81')  # Same for SPM.
+  _WPM_SEPARATOR = _ToUnicode(b'\xe2\x96\x81')  # Same for SPM.
 
   def __init__(self, separator_type=None):
     self._separator_type = separator_type
@@ -73,7 +62,7 @@ class Unsegmenter(object):
       return line
 
 
-class BleuScorer(object):
+class BleuScorer:
   """Scorer to compute BLEU scores to measure translation quality.
 
   The BLEU score is the geometric average precision of all token n-grams of
@@ -119,7 +108,7 @@ class BleuScorer(object):
           # Clip hyp_matches so ngrams that are repeated more frequently in hyp
           # than ref are not double counted.
           hyp_matches[x] = min(hyp_matches[x] + 1, count)
-      self._hyp_ngram_matches[order_idx] += sum(six.itervalues(hyp_matches))
+      self._hyp_ngram_matches[order_idx] += sum(hyp_matches.values())
       self._hyp_ngram_counts[order_idx] += hyp_count
 
   def ComputeOverallScore(self):

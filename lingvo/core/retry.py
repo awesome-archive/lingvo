@@ -14,17 +14,14 @@
 # ==============================================================================
 """Retry on exception."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import functools
 import itertools
-import time
-import traceback
 import random
 import sys
-import tensorflow as tf
+import time
+import traceback
+
+import lingvo.compat as tf
 
 
 def Retry(retry_value=Exception,
@@ -43,7 +40,8 @@ def Retry(retry_value=Exception,
   def _Retry(func):
 
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    def Wrapper(*args, **kwargs):
+      """Decorator wrapper."""
       delay = initial_delay_sec
       for retries in itertools.count(0):
         try:
@@ -67,6 +65,6 @@ def Retry(retry_value=Exception,
               "Waiting for %.2f seconds before retrying.", func.__name__,
               e_desc_str, stack_traceback_str, e_traceback_str, delay)
 
-    return wrapper
+    return Wrapper
 
   return _Retry

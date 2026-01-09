@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,59 +12,106 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for tokenizers that are not in the ops tests."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import numpy as np
-
-import tensorflow as tf
+"""Tests for tokenizers."""
 
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.core import tokenizers
 
 
-class TokenizersTest(tf.test.TestCase):
+class SentencePieceTokenizerTest(test_utils.TestCase):
 
-  def testStringsTokenId(self):
-    p = tokenizers.WpmTokenizer.Params()
-    p.vocab_filepath = test_helper.test_src_dir_path('tasks/mt/wpm-ende.voc')
-    p.vocab_size = 32000
-    wpm_tokenizer = p.cls(p)
-    with self.session(use_gpu=False) as sess:
-      token_ids, target_ids, paddings = sess.run(
-          wpm_tokenizer.StringsToIds(
-              tf.constant(['would that it were so simple', 'this is it', ''],
-                          dtype=tf.string), 6, True))
-    self.assertAllEqual(
-        token_ids, [[1, 926, 601, 560, 1273, 721], [1, 647, 470, 560, 2, 2],
-                    [1, 2, 2, 2, 2, 2]])
-    self.assertAllEqual(target_ids,
-                        [[926, 601, 560, 1273, 721, 5490],
-                         [647, 470, 560, 2, 2, 2], [2, 2, 2, 2, 2, 2]])
-    self.assertAllEqual(paddings,
-                        [[0., 0., 0., 0., 0., 0.], [0., 0., 0., 0., 1., 1.],
-                         [0., 1., 1., 1., 1., 1.]])
+  def _Params(self):
+    p = tokenizers.SentencePieceTokenizer.Params()
+    p.spm_model = test_helper.test_src_dir_path('core/testdata/en-1k.spm.model')
+    p.vocab_size = 1024
+    return p
 
-  def testIdToStrings(self):
-    p = tokenizers.WpmTokenizer.Params()
-    p.vocab_filepath = test_helper.test_src_dir_path('tasks/mt/wpm-ende.voc')
-    p.vocab_size = 32000
-    wpm_tokenizer = p.cls(p)
-    with self.session(use_gpu=False) as sess:
-      ref = tf.constant([
-          'would that it were so simple',
-          'this is it',
-          '',
-      ])
-      token_ids, target_ids, paddings = sess.run(
-          wpm_tokenizer.StringsToIds(ref, 100, True))
-      lens = np.argmax(paddings > 0.0, axis=1) - 1
-      found = sess.run(wpm_tokenizer.IdsToStrings(target_ids, lens))
-      self.assertAllEqual(ref, found)
+  def testStringsToIds(self):
+    p = self._Params()
+    tokenizer = p.Instantiate()
+
+    strs = ['Hello world!', 'why', '']
+
+    ids, labels, paddings = tokenizer.StringsToIds(strs, max_length=None)
+    with self.session() as sess:
+      ids, labels, paddings = sess.run([ids, labels, paddings])
+
+    # pyformat: disable
+    # pylint: disable=bad-whitespace
+    self.assertAllEqual([[136, 263,  36, 779, 185,   2],
+                         [109, 534,   2,   0,   0,   0],
+                         [  2,   0,   0,   0,   0,   0]],
+                        labels)
+    self.assertAllEqual([[  1, 136, 263,  36, 779, 185],
+                         [  1, 109, 534,   2,   0,   0],
+                         [  1,   2,   0,   0,   0,   0]],
+                        ids)
+    self.assertAllEqual([[0, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 1, 1, 1],
+                         [0, 1, 1, 1, 1, 1]],
+                        paddings)
+    # pylint: enable=bad-whitespace
+    # pyformat: enable
+
+  def testStringsToIds_MaxLength(self):
+    p = self._Params()
+    tokenizer = p.Instantiate()
+
+    strs = ['Hello world!', 'why', '']
+
+    ids, labels, paddings = tokenizer.StringsToIds(strs, max_length=4)
+    with self.session() as sess:
+      ids, labels, paddings = sess.run([ids, labels, paddings])
+
+    # pyformat: disable
+    # pylint: disable=bad-whitespace
+    self.assertAllEqual([[136, 263,  36, 779],
+                         [109, 534,   2,   0],
+                         [  2,   0,   0,   0]],
+                        labels)
+    self.assertAllEqual([[  1, 136, 263,  36],
+                         [  1, 109, 534,   2],
+                         [  1,   2,   0,   0]],
+                        ids)
+    self.assertAllEqual([[0, 0, 0, 0],
+                         [0, 0, 0, 1],
+                         [0, 1, 1, 1]],
+                        paddings)
+    # pylint: enable=bad-whitespace
+    # pyformat: enable
+
+  def testIdsToStrings(self):
+    p = self._Params()
+    tokenizer = p.Instantiate()
+
+    ids = [[136, 263, 36, 779, 185, 2], [109, 534, 2, 0, 0, 0],
+           [2, 0, 0, 0, 0, 0]]
+    lens = [6, 3, 1]
+
+    strs = tokenizer.IdsToStrings(ids, lens)
+    with self.session() as sess:
+      strs = sess.run(strs)
+
+    self.assertAllEqual(['Hello world!', 'why', ''], strs.astype(str))
+
+  def testIdsToTokens(self):
+    p = self._Params()
+    tokenizer = p.Instantiate()
+
+    ids = [[136, 263, 36, 779, 185, 2], [109, 534, 2, 0, 0, 0],
+           [2, 0, 0, 0, 0, 0]]
+
+    tokens = tokenizer.IdsToTokens(ids)
+    with self.session() as sess:
+      tokens = sess.run(tokens)
+
+    ref_tokens = [[
+        b'\xe2\x96\x81H', b'ell', b'o', b'\xe2\x96\x81world', b'!', b'</s>'
+    ], [b'\xe2\x96\x81w', b'hy', b'</s>', b'<unk>', b'<unk>', b'<unk>'],
+                  [b'</s>', b'<unk>', b'<unk>', b'<unk>', b'<unk>', b'<unk>']]
+    self.assertAllEqual(ref_tokens, tokens)
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()

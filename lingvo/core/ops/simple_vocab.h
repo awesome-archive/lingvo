@@ -28,6 +28,9 @@ limitations under the License.
 namespace tensorflow {
 namespace lingvo {
 
+// '▁' U+2581 lower one eighth block
+static constexpr char kBowStr[] = "\xe2\x96\x81";
+
 class Vocab {
  public:
   Vocab() {}
@@ -56,6 +59,8 @@ class Vocab {
     if (it != token_to_id_.end()) return it->second;
     return unk_id_;
   }
+
+  int GetVocabSize() const { return id_to_token_.size(); }
 
   void GreedyMatchStringToTokenId(StringPiece text, int32* token_id,
                                   int* token_size) const {
@@ -102,6 +107,17 @@ class Vocab {
       toks.push_back(IdToToken(id));
     }
     return toks;
+  }
+
+  std::vector<bool> GetBowTokenIds() const {
+    std::vector<bool> is_bow_token_id(id_to_token_.size(), false);
+    static const int bowStrLen = strlen(kBowStr);
+    for (auto const& kv : id_to_token_) {
+      if (kv.second.substr(0, bowStrLen) == kBowStr) {
+        is_bow_token_id[kv.first] = true;
+      }
+    }
+    return is_bow_token_id;
   }
 
  private:

@@ -1,24 +1,27 @@
-# Language modelling related tasks.
-package(
-    default_visibility = ["//visibility:public"],
-)
-
-licenses(["notice"])  # Apache 2.0
-
+# Placeholder: load py_library
+# Placeholder: load py_test
 load(
     "//lingvo:lingvo.bzl",
     "lingvo_cuda_py_test",
 )
 
+# Language modelling related tasks.
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
 py_library(
     name = "input_generator",
     srcs = ["input_generator.py"],
     deps = [
-        # Implicit tensorflow dependency.
+        ":tokenizer",
+        "//lingvo:compat",
         "//lingvo/core:base_input_generator",
+        "//lingvo/core:generic_input",
         "//lingvo/core:py_utils",
+        "//lingvo/core:summary_utils",
         "//lingvo/core:tokenizers",
-        "//lingvo/core/ops:py_x_ops",
+        "//lingvo/core/ops",
     ],
 )
 
@@ -30,8 +33,9 @@ py_test(
     ],
     deps = [
         ":input_generator",
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -39,11 +43,12 @@ py_library(
     name = "layers",
     srcs = ["layers.py"],
     deps = [
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:base_layer",
+        "//lingvo/core:batch_major_attention",
         "//lingvo/core:layers",
         "//lingvo/core:layers_with_attention",
+        "//lingvo/core:layers_with_gpipe",
         "//lingvo/core:py_utils",
         "//lingvo/core:rnn_cell",
         "//lingvo/core:rnn_layers",
@@ -53,15 +58,14 @@ py_library(
 lingvo_cuda_py_test(
     name = "layers_test",
     srcs = ["layers_test.py"],
-    shard_count = 10,
+    shard_count = 20,
     tags = ["noasan"],
     deps = [
         ":layers",
-        # Implicit numpy dependency.
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -70,12 +74,11 @@ py_library(
     srcs = ["model.py"],
     deps = [
         ":layers",
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
-        "//lingvo/core:base_layer",
+        "//lingvo:compat",
         "//lingvo/core:base_model",
-        "//lingvo/core:lr_schedule",
+        "//lingvo/core:hyperparams",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
     ],
 )
 
@@ -89,10 +92,20 @@ py_test(
     deps = [
         ":input_generator",
         ":model",
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:test_helper",
         "//lingvo/core:test_utils",
         "//lingvo/core:tokenizers",
+    ],
+)
+
+py_library(
+    name = "tokenizer",
+    srcs = ["tokenizer.py"],
+    deps = [
+        "//lingvo:compat",
+        "//lingvo/core:py_utils",
+        "//lingvo/core:tokenizers",
+        # Implicit tensorflow_text dependency.
     ],
 )

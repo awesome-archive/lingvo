@@ -14,18 +14,13 @@
 # ==============================================================================
 """Tokenizers."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import numpy as np
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
+from lingvo.core import ops
 from lingvo.core import py_utils
-from lingvo.core.ops import py_x_ops
 from lingvo.core import wpm_encoder
+
+import tensorflow_text as tf_text
 
 
 class BaseTokenizer(base_layer.BaseLayer):
@@ -34,7 +29,7 @@ class BaseTokenizer(base_layer.BaseLayer):
   @classmethod
   def Params(cls):
     """Defaults params for tokenizers."""
-    p = super(BaseTokenizer, cls).Params()
+    p = super().Params()
     p.name = 'tokenizer'
     p.Define('vocab_size', 64, 'The size of the vocabuary.')
     p.Define(
@@ -47,16 +42,20 @@ class BaseTokenizer(base_layer.BaseLayer):
     p.Define('target_unk_id', 0, 'Target unknown token id.')
     p.Define('target_sos_id', 1, 'Target start of sequence id.')
     p.Define('target_eos_id', 2, 'Target end of sequence id.')
+    p.Define('target_wb_id', -1, 'Target word boundary id.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(BaseTokenizer, self).__init__(params)
+    super().__init__(params)
     p = self.params
 
     self.sos_id = p.target_sos_id  # <S>
     self.eos_id = p.target_eos_id  # </S>
     self.unk_id = p.target_unk_id  # <UNK>
+
+  def Initialize(self, sess):
+    """Run any tokenizer initialization that requires a session."""
+    pass
 
   def StringsToIds(self,
                    strs,
@@ -90,16 +89,97 @@ class BaseTokenizer(base_layer.BaseLayer):
     else:
       append_eos = external_append_eos
 
-    ids, labels, paddings = self._StringsToIdsImpl(strs, max_length, append_eos,
-                                                   languages)
-    if py_utils.use_tpu():
-      batch_size = strs.shape[0]
-      ids.set_shape([batch_size, max_length])
-      labels.set_shape([batch_size, max_length])
-      paddings.set_shape([batch_size, max_length])
-    return ids, labels, paddings
+    return self._StringsToIdsImpl(strs, max_length, append_eos, languages)
+
+  def StringsToIdsWithSegments(self,
+                               strs,
+                               max_length,
+                               external_append_eos=None,
+                               languages=None):
+    """Same as StringsToIds, but can process strs that contain segments...
+
+    separated by <segment> delimiter, and return the segment ids corresponding
+    to each label.
+
+    Args:
+      strs: A vector of strings.
+      max_length: An int providing the max_length for strs.
+      external_append_eos: Bool or None. If None, will be ignored and
+        `params.append_eos` will be used. If bool, will determine if an eos
+        symbol will be added to tokens.
+      languages: A vector of strings with the same length as `strs`.
+
+    Returns:
+      A tuple (ids, labels, paddings) with the same shape [batch, maxlen].
+
+      - ids[i, j] is the input token id of i-th sample for j-th step.
+      - labels[i, j] is the target token id of i-th sample for j-th step.
+      - paddings[i, j] is 1 iff i-th sample's j-th step is padded.
+      - segment_ids[i, j] is the segment id of i-th sample for j-th step.
+
+    Raises:
+      ValueError: If unknown token type.
+    """
+    # TODO(cjzheng) make segment delimiter configurable
+    p = self.params
+
+    if external_append_eos is None:
+      append_eos = p.append_eos
+    else:
+      append_eos = external_append_eos
+
+    return self._StringsToIdsWithSegmentsImpl(strs, max_length, append_eos,
+                                              languages)
+
+  def StringsToIdsWithOffsets(self,
+                              strs,
+                              max_length,
+                              external_append_eos=None,
+                              languages=None):
+    """Tokenize strs into vocab ids, and also return byte-level offsets.
+
+    Args:
+      strs: A vector of strings.
+      max_length: An int providing the max_length for strs.
+      external_append_eos: Bool or None. If None, will be ignored and
+        `params.append_eos` will be used. If bool, will determine if an eos
+        symbol will be added to tokens.
+      languages: A vector of strings with the same length as `strs`.
+
+    Returns:
+      A tuple (ids, labels, paddings, start_offsets, end_offsets). Each tensor
+      has the same shape [batch, maxlen].
+
+      - ids[i, j] is the input token id of i-th sample for j-th step.
+      - labels[i, j] is the target token id of i-th sample for j-th step.
+      - paddings[i, j] is 1 iff i-th sample's j-th step is padded.
+      - start_offset[i, j] is the byte-level offset of the start of the j-th id
+          in the i-th original string
+      - end_offset[i, j] is the byte-level offset of the end of the j-th id
+          in the i-th original string
+
+    Raises:
+      ValueError: If unknown token type.
+      Exception: If the tokenizer does not support offsets.
+    """
+    p = self.params
+    if external_append_eos is None:
+      append_eos = p.append_eos
+    else:
+      append_eos = external_append_eos
+
+    return self._StringsToIdsWithOffsetsImpl(strs, max_length, append_eos,
+                                             languages)
 
   def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
+    raise NotImplementedError('Abstract method.')
+
+  def _StringsToIdsWithOffsetsImpl(self, strs, max_length, append_eos,
+                                   languages):
+    raise NotImplementedError('Abstract method.')
+
+  def _StringsToIdsWithSegmentsImpl(self, strs, max_length, append_eos,
+                                    languages):
     raise NotImplementedError('Abstract method.')
 
   def IdsToStrings(self, ids, lens, languages=None):
@@ -121,6 +201,22 @@ class BaseTokenizer(base_layer.BaseLayer):
     """
     raise NotImplementedError('Abstract method.')
 
+  def IdsToTokens(self, ids, languages=None):
+    """Converts ids back to tokens (as separate strings).
+
+    Args:
+      ids: A matrix of shape [batch, seqlen]. ids[i, :] is the i-th sample's
+        ids.
+      languages: A vector of strings of shape [batch].
+
+    Returns:
+      tokens - A matrix of shape [batch, seqlen] of bytes.
+
+    Raises:
+      ValueError: If unknown token type.
+    """
+    raise NotImplementedError('Abstract method.')
+
 
 class AsciiTokenizer(BaseTokenizer):
   """A simple grapheme tokenizer.
@@ -131,14 +227,14 @@ class AsciiTokenizer(BaseTokenizer):
 
   def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
     p = self.params
-    return py_x_ops.ascii_to_token_id(
+    return ops.ascii_to_token_id(
         strs,
         maxlen=max_length,
         pad_to_maxlen=p.pad_to_max_length,
         append_eos=append_eos)
 
   def IdsToStrings(self, ids, lens):
-    return py_x_ops.id_to_ascii(ids, lens)
+    return ops.id_to_ascii(ids, lens)
 
 
 class VocabFileTokenizer(BaseTokenizer):
@@ -146,7 +242,7 @@ class VocabFileTokenizer(BaseTokenizer):
 
   @classmethod
   def Params(cls):
-    p = super(VocabFileTokenizer, cls).Params()
+    p = super().Params()
     p.Define('token_vocab_filepath', None,
              'If set, specifies a filepath to the token vocab file.')
     p.Define('ngram_vocab_filepath', None,
@@ -178,7 +274,7 @@ class VocabFileTokenizer(BaseTokenizer):
     p = self.params
 
     if p.token_vocab_filepath:
-      return py_x_ops.str_to_vocab_tokens(
+      return ops.str_to_vocab_tokens(
           strs,
           maxlen=max_length,
           pad_to_maxlen=p.pad_to_max_length,
@@ -199,7 +295,7 @@ class VocabFileTokenizer(BaseTokenizer):
       ngram_vocab_filepath = p.ngram_vocab_filepath
       ngram_separator = p.ngram_separator
 
-    return py_x_ops.ngram_id_to_token(
+    return ops.ngram_id_to_token(
         token_ids=ids,
         seq_lengths=lens,
         ngram_vocab_filepath=ngram_vocab_filepath,
@@ -211,7 +307,7 @@ class BpeTokenizer(BaseTokenizer):
 
   @classmethod
   def Params(cls):
-    p = super(BpeTokenizer, cls).Params()
+    p = super().Params()
     p.Define('codes_filepath', None,
              'Specifies a filepath to the list of bpe codes vocab file.')
     p.Define('words_to_ids_filepath', None,
@@ -221,7 +317,7 @@ class BpeTokenizer(BaseTokenizer):
   def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
     p = self.params
 
-    return py_x_ops.bpe_words_to_ids(
+    return ops.bpe_words_to_ids(
         strs,
         maxlen=max_length,
         append_eos=append_eos,
@@ -230,7 +326,7 @@ class BpeTokenizer(BaseTokenizer):
   def IdsToStrings(self, ids, lens):
     p = self.params
 
-    return py_x_ops.bpe_ids_to_words(
+    return ops.bpe_ids_to_words(
         token_ids=ids, seq_lengths=lens, vocab_filepath=p.codes_filepath)
 
 
@@ -239,7 +335,7 @@ class WpmTokenizer(BaseTokenizer):
 
   @classmethod
   def Params(cls):
-    p = super(WpmTokenizer, cls).Params()
+    p = super().Params()
     p.Define(
         'vocab_filepath', None,
         'Specifies a filepath to the WPM vocab. The vocab is sorted by '
@@ -251,9 +347,8 @@ class WpmTokenizer(BaseTokenizer):
         'result in longer ID sequences. At 0, it will be graphemes.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(WpmTokenizer, self).__init__(params)
+    super().__init__(params)
     p = self.params
     self._wpm_encoder = wpm_encoder.WpmEncoder(p.vocab_filepath, p.merge_prob)
     assert p.target_unk_id == self._wpm_encoder.unk_id
@@ -275,12 +370,14 @@ class WpmTokenizer(BaseTokenizer):
       languages: A vector of strings with the same length as `strs`.
 
     Returns:
-      token_ids: a tensor of sequences of WPM ids starting with SOS. Sequences
+      A tuple of 3 tensors:
+
+      - token_ids: a tensor of sequences of WPM ids starting with SOS. Sequences
         always end with EOS unless the sequence exceeds the maximum length.
         Always padded with EOS.
-      target_ids: a tensor of sequences of WPM ids not starting with SOS
+      - target_ids: a tensor of sequences of WPM ids not starting with SOS
         but ending with EOS. Always padded with EOS.
-      paddings: a tensor of floats indicating, at each position, whether
+      - paddings: a tensor of floats indicating, at each position, whether
         the corresponding position is padded.
     """
     p = self.params
@@ -328,7 +425,9 @@ class WpmTokenizer(BaseTokenizer):
     paddings = paddings_ta.stack()
 
     if not p.pad_to_max_length:
-      maxlen = tf.to_int32(tf.reduce_max(tf.reduce_sum(1.0 - paddings, axis=1)))
+      maxlen = tf.cast(
+          tf.round(tf.reduce_max(tf.reduce_sum(1.0 - paddings, axis=1))),
+          tf.int32)
       token_ids = token_ids[:, :maxlen]
       target_ids = target_ids[:, :maxlen]
       paddings = paddings[:, :maxlen]
@@ -345,3 +444,87 @@ class WpmTokenizer(BaseTokenizer):
         dtype=tf.string,
         parallel_iterations=30,
         back_prop=False)
+
+
+class SentencePieceTokenizer(BaseTokenizer):
+  """SentencePiece tokenizer (https://arxiv.org/abs/1808.06226).
+
+  This is a wrapper around tf_text.SentencepieceTokenizer.
+
+  NOTE: this tokenizer is incompatible with GenericInput (b/191804185).
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.vocab_size = 0
+    p.Define('spm_model', None, 'The file path to the SentencePiece model.')
+    p.Define('alpha', 1.0,
+             'Inverse temparature for probability rescaling used in eval.')
+    p.Define(
+        'nbest_size', 0, 'A integer parameter for sampling.'
+        ' nbest_size = {0,1}: No sampling is performed.'
+        ' nbest_size > 1: samples from the nbest_size results.'
+        ' nbest_size < 0: assuming that nbest_size is infinite and samples from'
+        '                 all hypothesis (lattice) using'
+        '                 forward-filtering-and-backward-sampling algorithm.')
+    return p
+
+  def __init__(self, params):
+    super().__init__(params)
+    p = self.params
+    with tf.io.gfile.GFile(p.spm_model, 'rb') as f:
+      self._tokenizer = tf_text.SentencepieceTokenizer(
+          model=f.read(),
+          out_type=tf.int32,
+          nbest_size=p.nbest_size,
+          alpha=p.alpha,
+          reverse=False,
+          add_bos=False,
+          add_eos=p.append_eos)
+
+  def StringsToIds(self,
+                   strs,
+                   max_length,
+                   external_append_eos=None,
+                   languages=None):
+    """Tokenize strs into vocab ids."""
+    if (external_append_eos is not None and
+        external_append_eos != self.params.append_eos):
+      raise ValueError('external_append_eos is not supported.')
+    if languages is not None:
+      raise ValueError('languages is not supported.')
+    return self._StringsToIdsImpl(
+        strs, max_length, append_eos=None, languages=None)
+
+  def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
+    del append_eos
+    del languages
+
+    p = self.params
+
+    tokens = self._tokenizer.tokenize(strs)
+    num_tokens = tokens.row_lengths(-1)
+
+    if max_length is None:
+      labels = tokens.to_tensor(default_value=p.target_unk_id)
+    else:
+      output_shape = tf.convert_to_tensor(strs).shape + [max_length]
+      labels = tokens.to_tensor(
+          default_value=p.target_unk_id, shape=output_shape)
+      num_tokens = tf.minimum(num_tokens, max_length)
+
+    ids = tf.concat([
+        tf.expand_dims(tf.ones_like(strs, tf.int32) * p.target_sos_id, -1),
+        labels[:, :-1]
+    ], -1)
+
+    paddings = 1.0 - tf.sequence_mask(
+        num_tokens, maxlen=max_length, dtype=tf.float32)
+    return ids, labels, paddings
+
+  def IdsToStrings(self, ids, lens, languages=None):
+    return self._tokenizer.detokenize(tf.RaggedTensor.from_tensor(ids, lens))
+
+  def IdsToTokens(self, ids, languages=None):
+    return self._tokenizer.id_to_string(ids)

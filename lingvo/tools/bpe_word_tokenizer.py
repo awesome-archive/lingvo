@@ -34,11 +34,7 @@ Typical workflow:
   bpe_word_tokenizer train_bpe_file vocab_file words_to_ids_file
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
+import lingvo.compat as tf
 
 tf.flags.DEFINE_string('encoded_filepath', '',
                        'Path to the BPE encoded corpus file.')
@@ -95,7 +91,7 @@ def main(_):
   vocab = _GetVocabulary(FLAGS.vocab_filepath)
   word_tokenization = _ExtractTokenization(FLAGS.encoded_filepath, vocab)
   with open(FLAGS.output_filepath, 'w') as output:
-    for word, ids in word_tokenization.iteritems():
+    for word, ids in word_tokenization.items():
       output.write(word + ' ')
       output.write(','.join(map(str, ids)))
       output.write('\r\n')

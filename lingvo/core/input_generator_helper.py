@@ -14,14 +14,7 @@
 # ==============================================================================
 """Helper functions for model."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import six
-from six.moves import range
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import py_utils
 
 
@@ -47,7 +40,7 @@ def ComputeSplits(batch_size, num_splits):
       tf.div([batch_size], num_splits),
       tf.constant(
           [num_splits], dtype=tf.int32))
-  mods = tf.tile(tf.constant([1]), tf.mod([batch_size], num_splits))
+  mods = tf.tile(tf.constant([1]), tf.math.floormod([batch_size], num_splits))
   zeros = tf.tile(tf.constant([0]),
                   tf.subtract(tf.shape(values), tf.shape(mods)))
   mods = tf.concat([mods, zeros], 0)
@@ -110,7 +103,7 @@ def SplitDictOfTensors(t_dict, num_splits):
   """
   keys = []
   values = []
-  for k, v in sorted(six.iteritems(t_dict)):
+  for k, v in sorted(t_dict.items()):
     keys.append(k)
     values.append(v)
 

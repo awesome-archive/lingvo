@@ -14,18 +14,13 @@
 # ==============================================================================
 """Tests for scorers."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import math
-import tensorflow as tf
-
 from lingvo.core import scorers
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 
 
-class BleuScorerTest(tf.test.TestCase):
+class BleuScorerTest(test_utils.TestCase):
 
   def testNGrams(self):
     words = 'a b c d e'.split(' ')
@@ -92,10 +87,10 @@ class BleuScorerTest(tf.test.TestCase):
     scorer = scorers.BleuScorer()
     with open(filename, 'rb') as fp:
       for line in fp:
-        hyp, ref = line[:-1].split('\t')
+        hyp, ref = line[:-1].split(b'\t')
         scorer.AddSentence(ref, hyp)
     self.assertAlmostEqual(0.313776, scorer.ComputeOverallScore(), places=5)
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()

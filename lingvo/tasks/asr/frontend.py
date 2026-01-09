@@ -14,18 +14,11 @@
 # ==============================================================================
 """Layers to construct an ASR frontend."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections
 import math
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import py_utils
-
 
 # AsrFrontendConfig which defines characteristics of the frontend that may
 # be relevant to interfacing code which needs to reason about inputs and
@@ -84,13 +77,10 @@ class BaseAsrFrontend(base_layer.BaseLayer):
     Args:
       theta: A NestedMap object containing weights' values of this layer and its
         children layers.
-      input_batch: A NestedMap with fields:
-
-        - 'src_inputs' - The inputs tensor,
-          compatible with model input. Expected to be of shape
-          [batch, time, ...].
+      input_batch: A NestedMap with fields:  - 'src_inputs' - The inputs tensor,
+        compatible with model input. Expected to be of shape [batch, time, ...].
         - 'paddings' - The paddings tensor. It is expected to be of shape
-          [batch, time].
+        [batch, time].
 
     Returns:
       NestedMap of encoder inputs which can be passed directly to a
@@ -128,10 +118,7 @@ class MelAsrFrontend(BaseAsrFrontend):
   resources.
 
   The frontend implements the following stages:
-      `Framer -> Window -> FFT -> FilterBank -> MeanStdDev`
-
-  Also, if stack_left_context > 0, this will further apply:
-      `FrameStack -> SubSample(stack_left_context + 1)`
+      `Framer -> Window -> FFT -> FilterBank -> MeanStdDev -> SubSample`
 
   The FProp input to this layer can either have rank 3 or rank 4 shape:
       [batch_size, timestep, packet_size, channel_count]
@@ -154,7 +141,7 @@ class MelAsrFrontend(BaseAsrFrontend):
 
   @classmethod
   def Params(cls):
-    p = super(MelAsrFrontend, cls).Params()
+    p = super().Params()
     p.name = 'frontend'
     p.Define('sample_rate', 16000.0, 'Sample rate in Hz')
     p.Define('channel_count', 1, 'Number of channels.')
@@ -166,14 +153,14 @@ class MelAsrFrontend(BaseAsrFrontend):
              'The lowest frequency of the mel-spectrogram analsis')
     p.Define('upper_edge_hertz', 7600.0,
              'The highest frequency of the mel-spectrogram analsis')
-    p.Define('preemph', 0.97,
-             'The first-order filter coefficient used for preemphasis')
+    p.Define(
+        'preemph', 0.97,
+        'The first-order filter coefficient used for preemphasis. When it '
+        'is 0.0, preemphasis is turned off.')
     p.Define('noise_scale', 8.0,
              'The amount of noise (in 16-bit LSB units) to add')
-    p.Define(
-        'window_fn', 'HANNING',
-        'Window function to apply (valid values are "HANNING", '
-        'and None)')
+    p.Define('window_fn', 'HANNING',
+             'Window function to apply (valid values are "HANNING", and None)')
     p.Define(
         'pad_end', False,
         'Whether to pad the end of `signals` with zeros when the provided '
@@ -183,15 +170,30 @@ class MelAsrFrontend(BaseAsrFrontend):
         'per_bin_mean', None,
         'Per-bin (num_bins) means for normalizing the spectrograms. '
         'Defaults to zeros.')
-    p.Define('per_bin_stddev', None, 'Per-bin (num_bins) standard deviations. '
-             'Defaults to ones.')
+    p.Define('per_bin_stddev', None,
+             'Per-bin (num_bins) standard deviations. Defaults to ones.')
     p.Define('stack_left_context', 0, 'Number of left context frames to stack.')
+    p.Define('stack_right_context', 0,
+             'Number of right context frames to stack.')
+    p.Define('frame_stride', 1, 'The frame stride for sub-sampling.')
+
+    p.Define('fft_overdrive', True,
+             'Whether to use twice the minimum fft resolution.')
+    p.Define('output_floor', 1.0,
+             'Minimum output of filterbank output prior to taking logarithm.')
+    p.Define(
+        'compute_energy', False,
+        'Whether to compute filterbank output on the energy of spectrum '
+        'rather than just the magnitude.')
+    p.Define('use_divide_stream', False,
+             'Whether use a divide stream to the input signal.')
     return p
 
   @staticmethod
   def GetConfigFromParams(params):
     """Returns an AsrFrontendConfig namedtuple with vital config settings."""
-    subsample_factor = params.num_bins * (params.stack_left_context + 1)
+    context_size = params.stack_left_context + params.stack_right_context + 1
+    subsample_factor = params.num_bins * context_size
     frame_step = round(params.sample_rate * params.frame_step_ms / 1000.0)
     return AsrFrontendConfig(
         is_null=False,
@@ -201,10 +203,12 @@ class MelAsrFrontend(BaseAsrFrontend):
         output_dim=subsample_factor,
         input_frame_ratio=frame_step * subsample_factor)
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(MelAsrFrontend, self).__init__(params)
+    super().__init__(params)
     p = self.params
+    if p.frame_stride < 1:
+      raise ValueError('frame_stride must be positive.')
+
     assert p.channel_count == 1, 'Only 1 channel currently supported.'
     # Make sure key params are in floating point.
     p.sample_rate = float(p.sample_rate)
@@ -216,9 +220,10 @@ class MelAsrFrontend(BaseAsrFrontend):
     self._frame_step = int(round(p.sample_rate * p.frame_step_ms / 1000.0))
     self._frame_size = (int(round(p.sample_rate * p.frame_size_ms / 1000.0)) + 1
                        )  # +1 for the preemph
-    # Overdrive means double FFT size.
-    # Note: 2* because of overdrive
-    self._fft_size = 2 * int(max(512, _NextPowerOfTwo(self._frame_size)))
+
+    self._fft_size = int(max(512, _NextPowerOfTwo(self._frame_size - 1)))
+    if p.fft_overdrive:
+      self._fft_size *= 2
 
     self._CreateWindowFunction()
 
@@ -241,7 +246,7 @@ class MelAsrFrontend(BaseAsrFrontend):
 
       self._window_fn = _HanningWindow
     else:
-      raise ValueError('Illegal value %r for window_fn param' % (p.window_fn,))
+      raise ValueError('Illegal value %r for window_fn param' % p.window_fn)
 
   @property
   def window_frame_size(self):
@@ -307,33 +312,53 @@ class MelAsrFrontend(BaseAsrFrontend):
     Args:
       theta: Layer theta.
       input_batch: PCM input map:
+      - 'src_inputs': int16 or float32 tensor of PCM audio data, scaled to
+      [-32768..32768] (versus [-1..1)!). See class comments for supported
+      input shapes.
+      - 'paddings': per frame 0/1 paddings. Shaped: [batch, frame].
 
-        - 'src_inputs': int16 or float32 tensor of PCM audio data, scaled to
-          +/-32768 (versus [-1..1)!). See class comments for supported input
-          shapes.
-        - 'paddings': per frame 0/1 paddings. Shaped: [batch, frame].
     Returns:
       NestedMap of encoder inputs which can be passed directly to a
       compatible encoder and contains:
-
-        - 'src_inputs': inputs to the encoder, minimally of shape
-          [batch, time, ...].
-        - 'paddings': a 0/1 tensor of shape [batch, time].
+      - 'src_inputs': inputs to the encoder, minimally of shape
+      [batch, time, ...].
+      - 'paddings': a 0/1 tensor of shape [batch, time].
     """
-    p = self.params
+
+    return self._FPropDefault(input_batch)
+
+  def _FPropDefault(self, input_batch):
     pcm_audio_data, pcm_audio_paddings = self._ReshapeToMono2D(
         input_batch.src_inputs, input_batch.paddings)
 
-    batch_size = py_utils.GetShape(pcm_audio_data)[0]
     mel_spectrogram, mel_spectrogram_paddings = self._FPropChunk(
-        theta, pcm_audio_data, pcm_audio_paddings)
+        pcm_audio_data, pcm_audio_paddings)
 
-    # Stack and sub-sample. Only subsampling with a stride of the stack size
-    # is supported.
+    mel_spectrogram, mel_spectrogram_paddings = self._PadAndReshapeSpec(
+        mel_spectrogram, mel_spectrogram_paddings)
+
+    return py_utils.NestedMap(
+        src_inputs=mel_spectrogram, paddings=mel_spectrogram_paddings)
+
+  def _StackSignal(self, signal, stack_size, stride):
+    signal = tf.signal.frame(
+        signal=signal,
+        frame_length=stack_size,
+        frame_step=stride,
+        pad_end=False,
+        axis=1,
+    )
+    signal = tf.reshape(signal, py_utils.GetShape(signal)[:2] + [-1])
+    return signal
+
+  def _PadAndReshapeSpec(self, mel_spectrogram, mel_spectrogram_paddings):
+    p = self.params
+    # Stack and sub-sample.
+    stack_size = 1
     if p.stack_left_context > 0:
       # Since left context is leading, pad the left by duplicating the first
       # frame.
-      stack_size = 1 + p.stack_left_context
+      stack_size += p.stack_left_context
       mel_spectrogram = tf.concat(
           [mel_spectrogram[:, 0:1, :]] * p.stack_left_context +
           [mel_spectrogram],
@@ -343,27 +368,32 @@ class MelAsrFrontend(BaseAsrFrontend):
           [mel_spectrogram_paddings],
           axis=1)
 
-      # Note that this is the maximum number of frames. Actual frame count
-      # depends on padding.
-      stacked_frame_dim = tf.shape(mel_spectrogram)[1] // stack_size
-      mel_spectrogram = tf.reshape(
-          mel_spectrogram[:, 0:(stack_size) * stacked_frame_dim, :],
-          [batch_size, stacked_frame_dim, stack_size * p.num_bins])
+    if p.stack_right_context > 0:
+      stack_size += p.stack_right_context
+      mel_spectrogram = tf.concat(
+          [mel_spectrogram] +
+          [mel_spectrogram[:, -1:, :]] * p.stack_right_context,
+          axis=1)
+      mel_spectrogram_paddings = tf.concat(
+          [mel_spectrogram_paddings] +
+          [mel_spectrogram_paddings[:, -1:]] * p.stack_right_context,
+          axis=1)
+
+    if p.stack_left_context or p.stack_right_context:
+      mel_spectrogram = self._StackSignal(mel_spectrogram, stack_size,
+                                          p.frame_stride)
+      mel_spectrogram_paddings = self._StackSignal(mel_spectrogram_paddings,
+                                                   stack_size, p.frame_stride)
       # After stacking paddings, pad if any source frame was padded.
       # Stacks into [batch_size, stacked_frame_dim, stack_size] like the
       # spectrogram stacking above, and then reduces the stack_size dim
       # to the max (effectively, making padding = 1.0 if any of the pre-stacked
       # frames were 1.0). Final shape is [batch_size, stacked_frame_dim].
-      mel_spectrogram_paddings = tf.reshape(
-          mel_spectrogram_paddings[:, 0:(stack_size) * stacked_frame_dim],
-          [batch_size, stacked_frame_dim, stack_size])
       mel_spectrogram_paddings = tf.reduce_max(mel_spectrogram_paddings, axis=2)
 
     # Add feature dim. Shape = [batch, time, features, 1]
     mel_spectrogram = tf.expand_dims(mel_spectrogram, -1)
-
-    return py_utils.NestedMap(
-        src_inputs=mel_spectrogram, paddings=mel_spectrogram_paddings)
+    return mel_spectrogram, mel_spectrogram_paddings
 
   def _ApplyPreemphasis(self, framed_signal):
     p = self.params
@@ -371,26 +401,38 @@ class MelAsrFrontend(BaseAsrFrontend):
         framed_signal[:, :, 1:] - p.preemph * framed_signal[:, :, 0:-1])
     return preemphasized
 
-  def _FPropChunk(self, theta, pcm_audio_chunk, pcm_audio_paddings):
+  def _GetMelPadding(self, pcm_audio_paddings):
     p = self.params
-    pcm_audio_chunk = tf.cast(pcm_audio_chunk, tf.float32)
-    # shape: [batch, time, _frame_size]
-    framed_signal = tf.signal.frame(pcm_audio_chunk, self._frame_size,
-                                    self._frame_step, p.pad_end)
     # shape: [batch, time, _frame_size]
     framed_paddings = tf.signal.frame(pcm_audio_paddings, self._frame_size,
                                       self._frame_step, p.pad_end)
+    # Pad spectrograms that have any padded frames.
+    mel_spectrogram_paddings = tf.reduce_max(framed_paddings, axis=2)
+    return mel_spectrogram_paddings
+
+  def _FPropChunk(self, pcm_audio_chunk, pcm_audio_paddings):
+    p = self.params
+    pcm_audio_chunk = tf.cast(pcm_audio_chunk, tf.float32)
+    if p.use_divide_stream:
+      pcm_audio_chunk = pcm_audio_chunk / 32768.0
+
+    # shape: [batch, time, _frame_size]
+    framed_signal = tf.signal.frame(pcm_audio_chunk, self._frame_size,
+                                    self._frame_step, p.pad_end)
 
     # Pre-emphasis.
-    if p.preemph != 1.0:
+    if p.preemph != 0.0:
       preemphasized = self._ApplyPreemphasis(framed_signal)
     else:
-      preemphasized = framed_signal[:-1]
+      preemphasized = framed_signal[..., :-1]
 
     # Noise.
     if p.noise_scale > 0.0:
-      noise_signal = tf.random_normal(
-          tf.shape(preemphasized), stddev=p.noise_scale, mean=0.0)
+      noise_signal = tf.random.normal(
+          tf.shape(preemphasized),
+          stddev=p.noise_scale,
+          mean=0.0,
+          seed=p.random_seed)
     else:
       noise_signal = 0.0
 
@@ -402,18 +444,14 @@ class MelAsrFrontend(BaseAsrFrontend):
 
     mel_spectrogram = self._MelSpectrogram(windowed_signal)
 
-    # Pad spectrograms that have any padded frames.
-    mel_spectrogram_paddings = tf.reduce_max(framed_paddings, axis=2)
-
-    output_floor = 1.0
-    mel_spectrogram_log = tf.log(
-        tf.maximum(float(output_floor), mel_spectrogram))
+    mel_spectrogram_log = tf.math.log(
+        tf.maximum(float(p.output_floor), mel_spectrogram))
 
     # Mean and stddev.
     mel_spectrogram_norm = (
         (mel_spectrogram_log - tf.convert_to_tensor(p.per_bin_mean)) /
         tf.convert_to_tensor(p.per_bin_stddev))
-    return mel_spectrogram_norm, mel_spectrogram_paddings
+    return mel_spectrogram_norm, self._GetMelPadding(pcm_audio_paddings)
 
   def _MelSpectrogram(self, signal):
     """Computes the mel spectrogram from a waveform signal.
@@ -422,12 +460,14 @@ class MelAsrFrontend(BaseAsrFrontend):
       signal: f32 Tensor, shaped [batch_size, num_samples]
 
     Returns:
-      features: f32 Tensor, shaped [batch_size, num_frames, mel_channels]
+      f32 features Tensor, shaped [batch_size, num_frames, mel_channels]
     """
     p = self.params
     # FFT.
     real_frequency_spectrogram = tf.signal.rfft(signal, [self._fft_size])
     magnitude_spectrogram = tf.abs(real_frequency_spectrogram)
+    if p.compute_energy:
+      magnitude_spectrogram = tf.square(magnitude_spectrogram)
 
     # Shape of magnitude_spectrogram is num_frames x (fft_size/2+1)
     # Mel_weight is [num_spectrogram_bins, num_mel_bins]

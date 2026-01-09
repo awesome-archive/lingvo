@@ -14,19 +14,11 @@
 # ==============================================================================
 """Input generator for image data."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
-import tempfile
-import tensorflow as tf
+import lingvo.compat as tf
+from lingvo.core import base_input_generator
 
 from tensorflow.python.ops import io_ops
-from lingvo.core import base_input_generator
-from lingvo.core import cluster_factory
-from lingvo.core import py_utils
-from lingvo.core.ops import py_x_ops
 
 
 class _MnistInputBase(base_input_generator.BaseTinyDatasetInput):
@@ -35,15 +27,16 @@ class _MnistInputBase(base_input_generator.BaseTinyDatasetInput):
   @classmethod
   def Params(cls):
     """Defaults params."""
-    p = super(_MnistInputBase, cls).Params()
+    p = super().Params()
     p.data_dtype = tf.uint8
     p.data_shape = (28, 28, 1)
     p.label_dtype = tf.uint8
     return p
 
   def _Preprocess(self, raw):
-    data = tf.stack(
-        [tf.image.per_image_standardization(img) for img in tf.unstack(raw)])
+    data = tf.stack([
+        tf.image.per_image_standardization(img) for img in tf.unstack(raw)
+    ])
     data.set_shape(raw.shape)
     return data
 
@@ -54,7 +47,7 @@ class MnistTrainInput(_MnistInputBase):
   @classmethod
   def Params(cls):
     """Defaults params."""
-    p = super(MnistTrainInput, cls).Params()
+    p = super().Params()
     p.data = 'x_train'
     p.label = 'y_train'
     p.num_samples = 60000
@@ -69,7 +62,7 @@ class MnistTestInput(_MnistInputBase):
   @classmethod
   def Params(cls):
     """Defaults params."""
-    p = super(MnistTestInput, cls).Params()
+    p = super().Params()
     p.data = 'x_test'
     p.label = 'y_test'
     p.num_samples = 10000
@@ -78,17 +71,31 @@ class MnistTestInput(_MnistInputBase):
     return p
 
 
-def FakeMnistData(train_size=60000, test_size=10000):
+def _GetRandomImages(batch_size):
+  images = tf.random.uniform((batch_size, 28, 28, 1), 0, 255, tf.int32)
+  return tf.cast(images, tf.uint8)
+
+
+def _GetRandomLabels(batch_size):
+  labels = tf.random.categorical(0.1 * tf.ones((1, 10)), batch_size)
+  return tf.cast(labels, tf.uint8)
+
+
+def FakeMnistData(tmpdir, train_size=60000, test_size=10000):
   """Fake Mnist data for unit tests."""
-  tmpdir = tempfile.mkdtemp()
   data_path = os.path.join(tmpdir, 'ckpt')
   with tf.Graph().as_default():
+    tf.random.set_seed(91)
     with tf.Session() as sess:
-      x_train = tf.ones((train_size, 28, 28, 1), dtype=tf.uint8)
-      y_train = tf.ones((train_size), dtype=tf.uint8)
-      x_test = tf.ones((test_size, 28, 28, 1), dtype=tf.uint8)
-      y_test = tf.ones((test_size), dtype=tf.uint8)
       sess.run(
-          io_ops.save_v2(data_path, ['x_train', 'y_train', 'x_test', 'y_test'],
-                         [''] * 4, [x_train, y_train, x_test, y_test]))
-  return tmpdir, data_path
+          io_ops.save_v2(
+              data_path,
+              tensor_names=['x_train', 'y_train', 'x_test', 'y_test'],
+              shape_and_slices=['', '', '', ''],
+              tensors=[
+                  _GetRandomImages(train_size),
+                  _GetRandomLabels(train_size),
+                  _GetRandomImages(test_size),
+                  _GetRandomLabels(test_size)
+              ]))
+  return data_path

@@ -14,13 +14,8 @@
 # ==============================================================================
 """Debug print tf records in text format."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+import lingvo.compat as tf
 import six
-
-import tensorflow as tf
 
 tf.flags.DEFINE_string('input_filepattern', '',
                        'File pattern of binary tfrecord files.')
@@ -48,10 +43,12 @@ def _ListDebugString(values, to_string=str):
 
 def _CustomShortDebugString(tf_example):
   text = []
-  for name, value in sorted(six.iteritems(tf_example.features.feature)):
+  for name, value in sorted(tf_example.features.feature.items()):
     if value.HasField('bytes_list'):
       if FLAGS.bytes_as_utf8:
-        utf8_values = [v.decode('utf-8') for v in value.bytes_list.value]
+        utf8_values = [
+            six.ensure_text(v, 'utf-8') for v in value.bytes_list.value
+        ]
         value_string = _ListDebugString(utf8_values)
       else:
         value_string = _ListDebugString(value.bytes_list.value)
@@ -67,7 +64,7 @@ def _PrintHeader(tf_example):
   """Prints table of contents."""
   # Typically, tf.Examples have the same features.
   tf.logging.info('==== FEATURES ====')
-  for name, value in sorted(six.iteritems(tf_example.features.feature)):
+  for name, value in sorted(tf_example.features.feature.items()):
     type_string = '<empty>'
     if value.HasField('bytes_list'):
       type_string = 'bytes'
@@ -81,7 +78,7 @@ def _PrintHeader(tf_example):
 
 def _PrintFiles():
   entry = 0
-  for filepath in tf.gfile.Glob(FLAGS.input_filepattern):
+  for filepath in tf.io.gfile.glob(FLAGS.input_filepattern):
     records = tf.compat.v1.io.tf_record_iterator(filepath)
     for serialized in records:
       if entry < FLAGS.skip_first_n:

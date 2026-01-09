@@ -13,20 +13,11 @@
 # limitations under the License.
 """Decoders for the speech model."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections
 import math
-
-from matplotlib import font_manager
-from six.moves import range
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import attention
 from lingvo.core import base_decoder
-from lingvo.core import base_layer
 from lingvo.core import cluster_factory
 from lingvo.core import layers
 from lingvo.core import plot
@@ -34,9 +25,11 @@ from lingvo.core import py_utils
 from lingvo.core import recurrent
 from lingvo.core import rnn_cell
 from lingvo.core import summary_utils
+from lingvo.core import symbolic
 from lingvo.tasks.asr import contextualizer_base
 from lingvo.tasks.asr import decoder_utils
 from lingvo.tasks.asr import fusion
+from matplotlib import font_manager
 
 
 def _ToTensorArray(name, v, max_seq_length, clear_after_read=None):
@@ -89,10 +82,12 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
   Sub-classes can customize behavior by implementing the following functions,
   which will modify the behavior of the decoder:
 
-  - GetTargetLabelSequencesWithBeamSearch: Needed for EMBR training.
-  - _InitBeamSearchStateCallback: Needed by beam search decoder.
-  - _PreBeamSearchStepCallback
-  - _PostBeamSearchStepCallback
+  For beam search decoder:
+    - _InitBeamSearchStateCallback
+    - _PreBeamSearchStepCallback
+    - _PostBeamSearchStepCallback
+  For EMBR training:
+    - ComputeHypsWithBeamSearch
 
   - MiscZeroState: NestedMap which represents the initial state for the
     'misc_states' in the DecoderStepState. The default implementation returns
@@ -177,20 +172,29 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
   # additional components are fine. In particular, the 'misc' field is a list of
   # TensorArrays corresponding to the 'misc_states' in the DecoderStepState
   # across all steps.
-  SequenceOutTensorArrays = collections.namedtuple(
-      'SequenceOutTensorArrays',
-      ['rnn_outs', 'step_outs', 'atten_probs', 'logits', 'fusion', 'misc'])
+  SequenceOutTensorArrays = collections.namedtuple('SequenceOutTensorArrays', [
+      'rnn_outs',
+      'step_outs',
+      'atten_probs',
+      'logits',
+      'fusion',
+      'misc',
+      'confidence_logits',
+  ])
   # pylint: enable=invalid-name
 
   @classmethod
   def Params(cls):
-    p = super(AsrDecoderBase, cls).Params()
+    p = super().Params()
     p.Define('dropout_prob', 0.0, 'Prob at which we do dropout.')
     p.Define('emb', layers.EmbeddingLayer.Params(), 'Embedding layer params.')
     p.Define('emb_dim', 0, 'dimension of the embedding layer.')
     p.Define('label_smoothing', None, 'Label smoothing class.')
-    p.Define('rnn_cell_tpl', rnn_cell.LSTMCellSimple.Params(),
-             'RNNCell params template.')
+    p.Define(
+        'rnn_cell_tpl', rnn_cell.LSTMCellSimple.Params(),
+        'RNNCell params template. '
+        'Can be a single param or '
+        'a list of rnn_layers params, one for each layer.')
     p.Define('rnn_cell_dim', 0, 'size of the rnn cells.')
     p.Define(
         'rnn_cell_hidden_dim', 0, 'internal size of the rnn cells. When '
@@ -205,7 +209,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     p.Define('atten_context_dim', 0,
              'Depth of the attention context vector output.')
     p.Define(
-        'attention_plot_font_properties', font_manager.FontProperties(),
+        'attention_plot_font_properties', '',
         'Adds font properties for the given file if set. Required '
         'for displaying east-Asian character sets on plot axes.')
     p.Define('rnn_layers', 1, 'Number of rnn layers.')
@@ -224,6 +228,10 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
         'Use per-token average loss when set to True (default); when set '
         'to False use sequence average loss (sum logP across tokens in an '
         'output sequence) and average across all sequences in the batch.')
+    p.Define(
+        'token_normalized_per_seq_loss', False,
+        'Whether or not to normalize the per-sequence loss by the sequence '
+        'length.')
     # Configs for scheduled sampling.
     p.Define(
         'min_ground_truth_prob', 1.0,
@@ -252,6 +260,18 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
         'to inject context into the decoder. The default NullContextualizer '
         'does not add parameters to the model nor changes the '
         'computation.')
+    p.Define('focal_loss_alpha', None, 'The weighting factor alpha.')
+    p.Define('focal_loss_gamma', None, 'Tunable focusing parameter.')
+    p.Define('adapter_layer_tpl', layers.MultitaskAdapterLayer.Params(),
+             'Params for domain/language adapter layer.')
+    p.Define(
+        'adapter_task_id_field', None,
+        'Setting this will enable the use of adapter layers. This is the name '
+        'of the field in the encoder_outputs to extract the tasks IDs for '
+        'adatper layers.')
+    p.Define('confidence', None, 'Additional confidence estimation module.')
+    p.Define('lm_for_confidence', False,
+             'Use LM scores for confidence estimation.')
 
     # Set some reasonable default values.
     # Default config for the embedding layer.
@@ -274,15 +294,35 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     # Other configs.
     p.target_seq_len = 300
     p.source_dim = 512
+    p.adapter_layer_tpl.data_format = 'TBC'
     return p
 
-  @base_layer.initializer
+  @classmethod
+  def UpdateTargetVocabSize(cls, p, vocab_size, wpm_model=None):
+    """Updates params with the vocab size and wpm model.
+
+    Args:
+      p: model params.
+      vocab_size: size of the vocabulary.
+      wpm_model: file name prefix pointing to a wordpiece model.
+
+    Returns:
+      Model params updated with the vocab size and wpm model.
+    """
+    p.emb.vocab_size = vocab_size
+    p.softmax.num_classes = vocab_size
+    p.fusion.lm = p.fusion.lm.cls.UpdateTargetVocabSize(
+        p.fusion.lm, vocab_size, wpm_model=wpm_model)
+    if p.label_smoothing:
+      p.label_smoothing.num_classes = vocab_size
+    return p
+
   def __init__(self, params):
     params = params.Copy()
     if params.min_ground_truth_prob < 1:
       # Move embedding lookup onto worker.
       params.emb.on_ps = False
-    super(AsrDecoderBase, self).__init__(params)
+    super().__init__(params)
 
     p = self.params
     assert not p.packed_input, ('Packed inputs are not yet supported for '
@@ -294,69 +334,90 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       raise ValueError('min_prob_step (%d) <= prob_decay_start_step (%d)' %
                        (p.min_prob_step, p.prob_decay_start_step))
 
-    if p.random_seed:
-      self._prng_seed = p.random_seed
+    if p.attention_plot_font_properties:
+      self._font_properties = font_manager.FontProperties(
+          fname=p.attention_plot_font_properties)
     else:
-      self._prng_seed = py_utils.GenerateSeedFromName(p.name)
-
-    self._font_properties = font_manager.FontProperties(
-        fname=p.attention_plot_font_properties)
+      self._font_properties = font_manager.FontProperties()
 
     name = p.name
-    with tf.variable_scope(name):
-      self.CreateChild('contextualizer', p.contextualizer)
-      atten_context_dim = self._GetAttenContextDim()
-      assert atten_context_dim > 0
+    self.CreateChild('contextualizer', p.contextualizer)
+    atten_context_dim = self._GetAttenContextDim()
+    assert symbolic.IsExpr(atten_context_dim) or atten_context_dim > 0
 
-      p.emb.dtype = p.dtype
-      p.emb.embedding_dim = p.emb_dim
-      self.CreateChild('emb', p.emb)
+    p.emb.dtype = p.dtype
+    p.emb.embedding_dim = p.emb_dim
+    self.CreateChild('emb', p.emb)
 
-      p.softmax.dtype = p.dtype
-      if p.softmax_uses_attention:
-        p.softmax.input_dim = p.rnn_cell_dim + atten_context_dim
+    params_rnn_cells = []
+    params_adapter_layers = []
+    feat_dim = p.emb_dim
+    for i in range(p.rnn_layers):
+      if isinstance(p.rnn_cell_tpl, (list, tuple)):
+        assert len(p.rnn_cell_tpl) == p.rnn_layers
+        rnn_cell_params = p.rnn_cell_tpl[i].Copy()
       else:
-        p.softmax.input_dim = p.rnn_cell_dim
-      self.CreateChild('softmax', p.softmax)
+        rnn_cell_params = p.rnn_cell_tpl.Copy()
+      rnn_cell_params.dtype = p.dtype
+      rnn_cell_params.inputs_arity = 2
+      decoder_utils.SetRnnCellNodes(p, rnn_cell_params)
+      rnn_cell_params.num_input_nodes = feat_dim + atten_context_dim
+      if i == 0:
+        rnn_cell_params.name = 'rnn_cell'
+      else:
+        rnn_cell_params.name = 'rnn_cell_%d' % i
+      feat_dim = rnn_cell_params.num_output_nodes
+      params_rnn_cells.append(rnn_cell_params)
+      if p.adapter_task_id_field is not None:
+        adapter_p = p.adapter_layer_tpl.Copy()
+        adapter_p.name = 'adapter_%d' % i
+        adapter_p.input_dim = feat_dim
+        params_adapter_layers.append(adapter_p)
+    self.CreateChildren('rnn_cell', params_rnn_cells)
+    self.CreateChildren('adapters', params_adapter_layers)
 
+    p.softmax.dtype = p.dtype
+    p.softmax.input_dim = feat_dim
+    if p.softmax_uses_attention:
+      p.softmax.input_dim += atten_context_dim
+    self.CreateChild('softmax', p.softmax)
+
+    if p.fusion:
       p.fusion.base_model_logits_dim = p.softmax.input_dim
       self.CreateChild('fusion', p.fusion)
 
-      params_rnn_cells = []
-      for i in range(p.rnn_layers):
-        rnn_cell_params = p.rnn_cell_tpl.Copy()
-        rnn_cell_params.dtype = p.dtype
-        rnn_cell_params.inputs_arity = 2
-        decoder_utils.SetRnnCellNodes(p, rnn_cell_params)
-        if i == 0:
-          rnn_cell_params.name = 'rnn_cell'
-          rnn_cell_params.num_input_nodes = p.emb_dim + atten_context_dim
-        else:
-          rnn_cell_params.name = 'rnn_cell_%d' % i
-          rnn_cell_params.num_input_nodes = p.rnn_cell_dim + atten_context_dim
-        params_rnn_cells.append(rnn_cell_params)
-      self.CreateChildren('rnn_cell', params_rnn_cells)
+    self._CreateAtten()
 
-      self._CreateAtten()
+    if p.label_smoothing is not None:
+      p.label_smoothing.name = 'smoother'
+      if p.label_smoothing.num_classes == 0:
+        p.label_smoothing.num_classes = p.softmax.num_classes
+      elif p.label_smoothing.num_classes != p.softmax.num_classes:
+        raise ValueError('label_smoothing.num_classes ({}) does not match '
+                         'softmax.num_classes ({})'.format(
+                             p.label_smoothing.num_classes,
+                             p.softmax.num_classes))
+      self.CreateChild('smoother', p.label_smoothing)
 
-      if p.label_smoothing is not None:
-        p.label_smoothing.name = 'smoother'
-        if p.label_smoothing.num_classes == 0:
-          p.label_smoothing.num_classes = p.softmax.num_classes
-        elif p.label_smoothing.num_classes != p.softmax.num_classes:
-          raise ValueError('label_smoothing.num_classes ({}) does not match '
-                           'softmax.num_classes ({})'.format(
-                               p.label_smoothing.num_classes,
-                               p.softmax.num_classes))
-        self.CreateChild('smoother', p.label_smoothing)
+    if p.confidence is not None:
+      p.confidence.name = 'confidence'
+      # Input to the confidence estimation module is:
+      # pre-softmax feature, token embedding
+      # softmax prob, top5 mean & std
+      # atten prob, top5 mean & std
+      # Refer to _ExtractConfidenceFeatures()
+      p.confidence.input_dim = p.softmax.input_dim + p.emb.embedding_dim + 6
+      # When LM score is used, another input is LM prob
+      if p.lm_for_confidence:
+        p.confidence.input_dim += 1
+      self.CreateChild('confidence', p.confidence)
 
   def _CreateAtten(self):
     p = self.params
     p.attention.dtype = p.dtype
-    p.attention.source_dim = (
-        p.attention.source_dim if p.attention.source_dim else p.source_dim)
+    p.attention.source_dim = p.attention.source_dim or p.source_dim
     p.attention.query_dim = (
-        p.attention.query_dim if p.attention.query_dim else p.rnn_cell_dim)
+        p.attention.query_dim or self.rnn_cell[0].params.num_output_nodes)
     self.CreateChild('atten', p.attention)
 
   def _GetAttenContextDim(self):
@@ -366,29 +427,22 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     additional_context_dim = self.contextualizer.GetContextDim()
     return audio_context_dim + additional_context_dim
 
-  def _ApplyDropout(self,
-                    x_in,
-                    deterministic=False,
-                    extra_seed=None,
-                    step_state=None):
+  def _ApplyDropout(self, theta, x_in, deterministic=False, extra_seed=None):
     p = self.params
     assert 0 <= p.dropout_prob and p.dropout_prob < 1.0
-    if p.is_eval or p.dropout_prob == 0.0:
+    if self.do_eval or p.dropout_prob == 0.0:
       return x_in
 
-    seed = self._prng_seed
-    if extra_seed:
-      seed += extra_seed
     if deterministic:
-      assert isinstance(step_state, py_utils.NestedMap)
-      assert 'global_step' in step_state, step_state.DebugString()
-      assert 'time_step' in step_state, step_state.DebugString()
-      seeds = seed + tf.stack([step_state.global_step, step_state.time_step])
+      seeds = py_utils.GenerateStepSeedPair(p)
+      if extra_seed:
+        seeds += extra_seed
       return py_utils.DeterministicDropout(x_in, 1.0 - p.dropout_prob, seeds)
     else:
-      if not p.random_seed:
-        seed = None
-      return tf.nn.dropout(x_in, 1.0 - p.dropout_prob, seed=seed)
+      seed = p.random_seed
+      if seed and extra_seed:
+        seed += extra_seed
+      return tf.nn.dropout(x_in, rate=p.dropout_prob, seed=seed)
 
   def _InitAttention(self, theta, encoder_outputs):
     """Intializes attention and returns a NestedMap with those values."""
@@ -400,6 +454,13 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     self.contextualizer.InitAttention(theta.contextualizer, packed_src)
     return packed_src
 
+  def _GetEncoderPaddings(self, encoder_outputs):
+    """Get Encoder Paddings from encoder_outputs."""
+    if encoder_outputs and isinstance(encoder_outputs.padding, tf.Tensor):
+      return encoder_outputs.padding
+    else:
+      return None
+
   def BaseZeroState(self,
                     theta,
                     encoder_outputs,
@@ -408,10 +469,9 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
                     per_step_source_padding=None):
     """Returns initial state of RNNs, and attention."""
     p = self.params
-    step_state = misc_zero_states.step_state
     rnn_states = []
     for i in range(p.rnn_layers):
-      rnn_states.append(self.rnn_cell[i].zero_state(bs))
+      rnn_states.append(self.rnn_cell[i].zero_state(theta.rnn_cell[i], bs))
 
     packed_src = self._InitAttention(theta, encoder_outputs)
     zero_atten_state = self.atten.ZeroAttentionState(
@@ -420,12 +480,13 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
         self.atten.ComputeContextVectorWithSource(
             theta.atten,
             packed_src,
-            tf.zeros([bs, p.rnn_cell_dim], dtype=py_utils.FPropDtype(p)),
+            py_utils.Zeros([bs, self.rnn_cell[0].params.num_output_nodes],
+                           dtype=py_utils.FPropDtype(p)),
             zero_atten_state,
-            per_step_source_padding=per_step_source_padding,
-            step_state=step_state))
-    atten_context = self.contextualizer.ZeroAttention(
-        theta.contextualizer, bs, misc_zero_states, atten_context, packed_src)
+            per_step_source_padding=per_step_source_padding))
+    atten_context = self.contextualizer.ZeroAttention(theta.contextualizer, bs,
+                                                      misc_zero_states,
+                                                      atten_context, packed_src)
 
     return rnn_states, atten_context, atten_probs, atten_states, packed_src
 
@@ -435,7 +496,8 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     pass
 
   def DecoderStepZeroState(self, theta, encoder_outputs, target_ids, bs):
-    misc_zero_states = self.MiscZeroState(encoder_outputs, target_ids, bs)
+    misc_zero_states = self.MiscZeroState(theta, encoder_outputs, target_ids,
+                                          bs)
     rnn_states, atten_context, atten_probs, atten_states, packed_src = (
         self.BaseZeroState(theta, encoder_outputs, bs, misc_zero_states))
     return py_utils.NestedMap(
@@ -443,7 +505,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
         atten_context=atten_context,
         atten_probs=atten_probs,
         atten_states=atten_states,
-        fusion_states=self.fusion.zero_state(bs),
+        fusion_states=self.fusion.zero_state(theta.fusion, bs),
         misc_states=misc_zero_states), packed_src
 
   def _AddDecoderActivationsSummary(self,
@@ -464,9 +526,8 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       targets: a NestedMap, usually input_batch.tgt.
       atten_probs: a TensorArray of max_target_length elements, each of shape
         [batch, max_source_length].
-      rnn_outs: a list of TensorArray, one for each RNN layer. Each
-        TensorArray has max_target_length elements, each of shape [batch,
-        rnn_output_dim].
+      rnn_outs: a list of TensorArray, one for each RNN layer. Each TensorArray
+        has max_target_length elements, each of shape [batch, rnn_output_dim].
       softmax_input: a Tensor of shape [batch, max_target_length, vocab_size].
       additional_atten_probs: an optional list of (name, TensorArray) to display
         along with atten_probs.
@@ -481,7 +542,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     source_encs = encoder_outputs.encoded
     source_paddings = encoder_outputs.padding
     if not self.cluster.add_summary:
-      return tf.summary.scalar('disabled_decoder_example', 0)
+      return
 
     def _ToTensor(t):
       return t.stack() if isinstance(t, tf.TensorArray) else t
@@ -507,18 +568,20 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     def PlotAttention(fig, axes, transcript, atten_probs, title):
       plot.AddImage(fig, axes, atten_probs, title=title)
       axes.set_ylabel(
-          plot.ToUnicode(transcript + '\nOutput token'),
+          plot.ToUnicode(transcript) + '\nOutput token',
           size='x-small',
           wrap=True,
           fontproperties=self._font_properties)
 
     index = 0
     if 'transcripts' not in targets:
-      return tf.summary.scalar('disabled_decoder_example', 0)
+      return
     transcript = targets.transcripts[:index + 1]
 
-    srclen = tf.cast(tf.reduce_sum(1 - source_paddings[:, index]), tf.int32)
-    tgtlen = tf.cast(tf.reduce_sum(1 - targets.paddings[index, :]), tf.int32)
+    srclen = tf.cast(
+        tf.round(tf.reduce_sum(1 - source_paddings[:, index])), tf.int32)
+    tgtlen = tf.cast(
+        tf.round(tf.reduce_sum(1 - targets.paddings[index, :])), tf.int32)
 
     def PlotAttentionForOneExample(atten_probs,
                                    target_fig,
@@ -554,8 +617,8 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     for i in range(len(rnn_outs)):
       rnn_out = tf.expand_dims(rnn_outs[i][:tgtlen, index, :], 0)
       fig.AddSubplot([rnn_out], title=u'rnn_outs/%d' % i)
-    fig.AddSubplot(
-        [softmax_input[:index + 1, :tgtlen, :]], title=u'softmax_input')
+    fig.AddSubplot([softmax_input[:index + 1, :tgtlen, :]],
+                   title=u'softmax_input')
     source_encs = tf.expand_dims(
         tf.transpose(source_encs[:srclen, index, :]), 0)
     fig.AddSubplot([source_encs], title=u'source_encs', xlabel=u'Encoder frame')
@@ -584,6 +647,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       target_labels: Tensor of shape [batch, time].
       target_weights: Tensor of shape [batch, time].
       target_probs: Tensor of shape [batch, time, num_classes].
+
     Returns:
       A (metrics, per_sequence_loss) pair.
     """
@@ -591,24 +655,28 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     target_weights_sum = tf.reduce_sum(target_weights)
     # add 0.000001 to avoid divide-by-zero.
     target_weights_sum_eps = target_weights_sum + 0.000001
-    if not py_utils.use_tpu():
-      correct_preds = tf.cast(
-          tf.equal(tf.argmax(logits, 2, output_type=tf.int32), target_labels),
-          py_utils.FPropDtype(p))
-      correct_next_preds = tf.reduce_sum(correct_preds * target_weights)
-      accuracy = tf.identity(
-          correct_next_preds / target_weights_sum_eps,
-          name='fraction_of_correct_next_step_preds')
+    correct_preds = tf.cast(
+        tf.equal(tf.argmax(logits, 2, output_type=tf.int32), target_labels),
+        py_utils.FPropDtype(p))
+    correct_next_preds = tf.reduce_sum(correct_preds * target_weights)
+    accuracy = tf.identity(
+        correct_next_preds / target_weights_sum_eps,
+        name='fraction_of_correct_next_step_preds')
     # Pad zeros so that we can stack them.
-    if target_probs is not None:
-      per_example_loss = tf.nn.softmax_cross_entropy_with_logits(
-          labels=target_probs, logits=logits)
-    else:
-      per_example_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-          labels=target_labels, logits=logits)
+    per_example_loss = py_utils.SoftmaxCrossEntropyFocalLoss(
+        logits=logits,
+        label_ids=target_labels,
+        label_probs=target_probs,
+        alpha=p.focal_loss_alpha,
+        gamma=p.focal_loss_gamma)
+
     per_sequence_loss = tf.reduce_sum(per_example_loss * target_weights, 1)
     per_token_avg_loss = (
         tf.reduce_sum(per_sequence_loss) / target_weights_sum_eps)
+    if p.token_normalized_per_seq_loss:
+      per_seq_length = tf.reduce_sum(target_weights, 1)
+      # +0.001 to avoid possible divide by 0.
+      per_sequence_loss /= (per_seq_length + 0.001)
     if p.per_token_avg_loss:
       loss = per_token_avg_loss
       loss_weight = target_weights_sum
@@ -618,12 +686,11 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     metrics = {
         'loss': (loss, loss_weight),
         # add log_pplx for compatibility with the mt/decoder.py
-        'log_pplx': (per_token_avg_loss, target_weights_sum)
+        'log_pplx': (per_token_avg_loss, target_weights_sum),
+        'token_normed_prob': (tf.exp(-per_token_avg_loss), target_weights_sum),
     }
-    if not py_utils.use_tpu():
-      metrics['fraction_of_correct_next_step_preds'] = (accuracy,
-                                                        target_weights_sum)
-
+    metrics['fraction_of_correct_next_step_preds'] = (accuracy,
+                                                      target_weights_sum)
     return metrics, per_sequence_loss
 
   def InitDecoder(self, theta, encoder_outputs, dec_bs):
@@ -639,108 +706,38 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
             decoder_step_zero_state.fusion_states,
             decoder_step_zero_state.misc_states, packed_src)
 
-  # TODO(rpang): add 'theta' as an arg to BeamSearchDecode().
-  def BeamSearchDecode(self, encoder_outputs, num_hyps_per_beam_override=0):
-    """Performs beam-search based decoding.
-
-    Args:
-      encoder_outputs: a NestedMap computed by encoder.
-      num_hyps_per_beam_override: If set to a value <= 0, this parameter is
-        ignored. If set to a value > 0, then this value will be used to override
-        p.num_hyps_per_beam.
-
-    Returns:
-      BeamSearchDecodeOutput, a namedtuple containing the decode results
-    """
-    return self.beam_search.BeamSearchDecode(
-        self.theta, encoder_outputs, num_hyps_per_beam_override,
-        self._InitBeamSearchStateCallback, self._PreBeamSearchStepCallback,
-        self._PostBeamSearchStepCallback)
-
-  def SampleTargetSequences(self, theta, encoder_outputs, random_seed):
-    """Performs target sequence sampling.
-
-    Args:
-      theta: A NestedMap object containing weights' values of this layer and its
-        children layers.
-      encoder_outputs: a NestedMap computed by encoder.
-      random_seed: a scalar int32 tensor representing the random seed.
-
-    Returns:
-      A NestedMap containing the following tensors:
-      - 'ids': [batch, max_target_length] of int32, representing the target
-        sequence ids, not including target_sos_id, but maybe ending with
-        target_eos_id if target_eos_id is sampled.
-      - 'paddings': [batch, max_target_length] of 0/1, where 1 represents
-        a padded timestep.
-    """
-    return self.target_sequence_sampler.Sample(
-        theta, encoder_outputs, random_seed, self._InitBeamSearchStateCallback,
-        self._PreBeamSearchStepCallback, self._PostBeamSearchStepCallback)
-
   def _InitBeamSearchStateCallback(self, theta, encoder_outputs,
                                    num_hyps_per_beam):
     raise NotImplementedError('_InitBeamSearchStateCallback')
 
   def _PreBeamSearchStepCallback(self, theta, encoder_outputs, step_ids, states,
-                                 num_hyps_per_beam):
+                                 num_hyps_per_beam, cur_step):
     raise NotImplementedError('_PreBeamSearchStepCallback')
 
   def _PostBeamSearchStepCallback(self, theta, encoder_outputs, new_step_ids,
                                   states):
     raise NotImplementedError('_PostBeamSearchStepCallback')
 
-  # TODO(tilarids): Can we remove this?
-  def FProp(self, theta, encoder_outputs, targets):
-    with tf.device(self.cluster.WorkerDeviceInModelSplit(0)):
-      predictions = self.ComputePredictions(theta, encoder_outputs, targets)
-      return self.ComputeLoss(theta, predictions, targets)[0]
-
-  def FPropWithPerExampleLoss(self,
-                              encoder_outputs,
-                              targets,
-                              targets_per_batch_element=1):
-    predictions = self.ComputePredictions(self.theta, encoder_outputs, targets,
-                                          targets_per_batch_element)
-    return self.ComputeMetricsAndPerSequenceLoss(
-        self.theta, predictions, targets, targets_per_batch_element)
-
-  def FPropWithPredictions(self, encoder_outputs, targets):
-    """Returns FProp() results together with predictions."""
-    predictions = self.ComputePredictions(self.theta, encoder_outputs, targets)
-    metrics, _ = self.ComputeMetricsAndPerSequenceLoss(self.theta, predictions,
-                                                       targets)
-    return metrics, predictions
-
   def ComputeLoss(self, theta, predictions, targets):
-    metrics, _ = self.ComputeMetricsAndPerSequenceLoss(theta, predictions,
-                                                       targets)
-    return metrics, {}
-
-  def ComputeMetricsAndPerSequenceLoss(self,
-                                       theta,
-                                       predictions,
-                                       targets,
-                                       targets_per_batch_element=1):
     """Computes loss metrics and per-sequence losses.
 
     Args:
-      theta: A NestedMap object containing weights' values of this
-        layer and its children layers.
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
       predictions: A NestedMap containing logits (and possibly other fields).
       targets: A dict of string to tensors representing the targets one is
-          trying to predict. Each tensor in targets is of shape [batch, time].
-      targets_per_batch_element: Number of target sequences per utterance.
+        trying to predict. Each tensor in targets is of shape [batch, time].
 
     Returns:
       (metrics, per_sequence_loss), where metrics is a dictionary containing
-      metrics for the xent loss and prediction accuracy. per_sequence_loss is a
-      (-log(p)) vector of size [bs].
+      metrics for the xent loss and prediction accuracy. per_sequence is a
+      dictionary containing 'loss', a (-log(p)) vector of size [bs].
     """
-    del targets_per_batch_element
     p = self.params
     with tf.name_scope(p.name):
-      if p.label_smoothing is not None:
+      if 'probs' in targets:
+        target_probs = targets.probs
+      elif p.label_smoothing is not None:
         target_probs = self.smoother.FProp(theta.smoother, targets.paddings,
                                            targets.labels, targets.ids)
       else:
@@ -754,11 +751,11 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
         return (acc[0] + scale * tf.cast(metric[0], py_utils.FPropDtype(p)),
                 acc[1] + scale * tf.cast(metric[1], py_utils.FPropDtype(p)))
 
-      for logit_name, loss_weight in p.logit_types.iteritems():
+      for logit_name, loss_weight in p.logit_types.items():
         metrics, per_sequence_loss = self._ComputeMetrics(
             getattr(predictions, logit_name), targets.labels, targets.weights,
             target_probs)
-        for k, v in metrics.iteritems():
+        for k, v in metrics.items():
           tf.logging.info('Merging metric %s: %s', k, v)
           merged_metrics[k + '/' + logit_name] = v
           if k not in merged_metrics:
@@ -768,7 +765,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
                                      shape=[], dtype=py_utils.FPropDtype(p)))
           merged_metrics[k] = AddToMetric(merged_metrics[k], loss_weight, v)
         merged_per_sequence_loss += loss_weight * per_sequence_loss
-      return merged_metrics, merged_per_sequence_loss
+      return merged_metrics, {'loss': merged_per_sequence_loss}
 
   def CreateTargetInfoMisc(self, targets):
     """Return a NestedMap corresponding to the 'misc' field in TargetInfo."""
@@ -779,11 +776,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     else:
       return py_utils.NestedMap()
 
-  def ComputePredictions(self,
-                         theta,
-                         encoder_outputs,
-                         targets,
-                         targets_per_batch_element=1):
+  def ComputePredictions(self, theta, encoder_outputs, targets):
     """Computes logits.
 
     Args:
@@ -792,7 +785,6 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       encoder_outputs: a NestedMap computed by encoder.
       targets: A dict of string to tensors representing the targets one is
         trying to predict. Each tensor in targets is of shape [batch, time].
-      targets_per_batch_element: (unused).
 
     Returns:
       A NestedMap object containing logit tensors as values, each of shape
@@ -800,20 +792,31 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       'logits'.
     """
     assert getattr(encoder_outputs, 'src_segment_id', None) is None
-    del targets_per_batch_element
     p = self.params
     self.contextualizer.SetContextMap(targets, theta.contextualizer)
+    if 'weights' not in targets and 'paddings' in targets:
+      targets.weights = 1.0 - targets.paddings
     if p.use_while_loop_based_unrolling:
       predictions = self.ComputePredictionsDynamic(theta, encoder_outputs,
                                                    targets)
     else:
       predictions = self.ComputePredictionsFunctional(theta, encoder_outputs,
                                                       targets)
-    if encoder_outputs and isinstance(encoder_outputs.padding, tf.Tensor):
+    encoder_paddings = self._GetEncoderPaddings(encoder_outputs)
+    if isinstance(encoder_paddings, tf.Tensor):
       # source_padding is of shape [time, batch]. Compute source_enc_len, which
       # is used for computing attention loss.
-      predictions.source_enc_len = tf.reduce_sum(
-          1 - encoder_outputs.padding, axis=0)
+      predictions.source_enc_len = tf.reduce_sum(1 - encoder_paddings, axis=0)
+      if 'paddings' in targets:
+        source_batch = py_utils.GetShape(encoder_paddings)[1]
+        target_batch = py_utils.GetShape(targets.paddings)[0]
+        multiplier = target_batch // source_batch
+        source_len = py_utils.RepeatDim(
+            predictions.source_enc_len, multiplier, axis=0)
+        target_len = tf.reduce_sum(1 - targets.paddings, axis=1)
+        target_source_length_ratio = target_len / tf.maximum(source_len, 1.0)
+        summary_utils.scalar('avg_target_source_length_ratio',
+                             tf.reduce_mean(target_source_length_ratio))
     return predictions
 
   def _GetInitialSeqStateTensorArrays(self, max_seq_length,
@@ -822,39 +825,50 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     """Get intitial tensor arrays for ComputePredictionsDynamic."""
     p = self.params
     # TensorArrays for sequence outputs.
+    rnn_outs = [
+        _NewTensorArray(
+            name='rnn%d_outs' % i,
+            max_seq_length=max_seq_length,
+            dtype=py_utils.FPropDtype(p)) for i in range(p.rnn_layers)
+    ]
+    step_outs = _NewTensorArray(
+        name='step_outs',
+        max_seq_length=max_seq_length,
+        dtype=py_utils.FPropDtype(p))
+    atten_probs = _NewTensorArray(
+        name='atten_probs',
+        max_seq_length=max_seq_length,
+        dtype=py_utils.FPropDtype(p))
+    logits = _NewTensorArray(
+        name='logits',
+        max_seq_length=max_seq_length,
+        dtype=py_utils.FPropDtype(p))
+    fusion_array = [
+        _NewTensorArray(
+            name='fusion_states%d' % i,
+            max_seq_length=max_seq_length,
+            dtype=decoder_step_state_zero_fusion_flat[i].dtype)
+        for i in range(len(decoder_step_state_zero_fusion_flat))
+    ]
+    misc = [
+        _NewTensorArray(
+            name='misc_states%d' % i,
+            max_seq_length=max_seq_length,
+            dtype=decoder_step_state_zero_misc_flat[i].dtype)
+        for i in range(len(decoder_step_state_zero_misc_flat))
+    ]
+    confidence_logits = _NewTensorArray(
+        name='confidence_logits',
+        max_seq_length=max_seq_length,
+        dtype=py_utils.FPropDtype(p))
     return AsrDecoder.SequenceOutTensorArrays(
-        rnn_outs=[
-            _NewTensorArray(
-                name='rnn%d_outs' % i,
-                max_seq_length=max_seq_length,
-                dtype=py_utils.FPropDtype(p)) for i in range(p.rnn_layers)
-        ],
-        step_outs=_NewTensorArray(
-            name='step_outs',
-            max_seq_length=max_seq_length,
-            dtype=py_utils.FPropDtype(p)),
-        atten_probs=_NewTensorArray(
-            name='atten_probs',
-            max_seq_length=max_seq_length,
-            dtype=py_utils.FPropDtype(p)),
-        logits=_NewTensorArray(
-            name='logits',
-            max_seq_length=max_seq_length,
-            dtype=py_utils.FPropDtype(p)),
-        fusion=[
-            _NewTensorArray(
-                name='fusion_states%d' % i,
-                max_seq_length=max_seq_length,
-                dtype=decoder_step_state_zero_fusion_flat[i].dtype)
-            for i in range(len(decoder_step_state_zero_fusion_flat))
-        ],
-        misc=[
-            _NewTensorArray(
-                name='misc_states%d' % i,
-                max_seq_length=max_seq_length,
-                dtype=decoder_step_state_zero_misc_flat[i].dtype)
-            for i in range(len(decoder_step_state_zero_misc_flat))
-        ])
+        rnn_outs=rnn_outs,
+        step_outs=step_outs,
+        atten_probs=atten_probs,
+        logits=logits,
+        fusion=fusion_array,
+        misc=misc,
+        confidence_logits=confidence_logits)
 
   def _GetNewAttenProbs(self, seq_out_tas, time, decoder_step_state):
     """Update atten probs for a timestep and return the updated tensor array."""
@@ -883,24 +897,40 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       new_seq_outs_misc_states.append(seq_out_tas.misc[i].write(
           time, new_misc_states_flat[i]))
 
+    if self.params.confidence is not None:
+      new_confidence_logits_ta = seq_out_tas.confidence_logits.write(
+          time, decoder_step_state.confidence_logits)
+    else:
+      # Fill the confidence field with softmax logits as a placeholder.
+      # Note that this will not be used as it will not pass to `predictions`.
+      new_confidence_logits_ta = seq_out_tas.confidence_logits.write(
+          time, decoder_step_state.logits)
     return AsrDecoder.SequenceOutTensorArrays(
         rnn_outs=new_rnn_outs,
         step_outs=new_step_outs_ta,
         atten_probs=new_atten_probs_ta,
         logits=new_logits_ta,
         fusion=new_seq_outs_fusion_states,
+        confidence_logits=new_confidence_logits_ta,
         misc=new_seq_outs_misc_states)
 
   def _GetAttenProbsFromSequenceOutTensorArrays(self, atten_probs):
     return tf.transpose(atten_probs.stack(), [1, 0, 2])
 
   def _GetPredictionFromSequenceOutTensorArrays(self, seq_out_tas):
-    # [max_target_length, batch, dim] -> [batch, max_target_length, dim].
-    return py_utils.NestedMap(
+    prediction = py_utils.NestedMap(
+        # softmax_input is of shape [time, batch, dim] for compatibility.
+        softmax_input=seq_out_tas.step_outs.stack(),
+        # logits is of shape [batch, time, dim].
         logits=tf.transpose(seq_out_tas.logits.stack(), [1, 0, 2]),
         attention=py_utils.NestedMap(
-            probs=self._GetAttenProbsFromSequenceOutTensorArrays(seq_out_tas
-                                                                 .atten_probs)))
+            probs=self._GetAttenProbsFromSequenceOutTensorArrays(
+                seq_out_tas.atten_probs)))
+    if self.params.confidence is not None:
+      # confidence_logits is of shape [batch, time].
+      prediction.confidence_logits = tf.transpose(
+          seq_out_tas.confidence_logits.stack())
+    return prediction
 
   def _GetInitialTargetInfo(self, targets, max_seq_length, target_embs):
     return AsrDecoderBase.TargetInfo(
@@ -916,8 +946,9 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
             clear_after_read=False),
         weight=_ToTensorArray('target_weights_ta',
                               tf.transpose(targets.weights), max_seq_length),
-        emb=_ToTensorArray('target_embs_ta', tf.transpose(
-            target_embs, [1, 0, 2]), max_seq_length),
+        emb=_ToTensorArray('target_embs_ta',
+                           tf.transpose(target_embs,
+                                        [1, 0, 2]), max_seq_length),
         padding=_ToTensorArray(
             'target_paddings_ta',
             tf.expand_dims(tf.transpose(targets.paddings), -1), max_seq_length),
@@ -934,7 +965,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
 
       target_embs = self.emb.EmbLookup(theta.emb, tf.reshape(targets.ids, [-1]))
       target_embs = tf.reshape(target_embs, [dec_bs, max_seq_length, p.emb_dim])
-      target_embs = self._ApplyDropout(target_embs)
+      target_embs = self._ApplyDropout(theta, target_embs)
       target_info_tas = self._GetInitialTargetInfo(targets, max_seq_length,
                                                    target_embs)
 
@@ -981,17 +1012,38 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
         decoder_step_state.logits = self.fusion.ComputeLogitsWithLM(
             decoder_step_state.fusion_states, decoder_step_state.logits)
 
+        if p.confidence is not None:
+          if p.lm_for_confidence:
+            lm_output = tf.expand_dims(
+                decoder_step_state.fusion_states.lm_output, axis=1)
+          else:
+            lm_output = None
+          confidence_features = self._ExtractConfidenceFeatures(
+              theta,
+              tf.expand_dims(cur_target_info.label, axis=1),
+              tf.expand_dims(xent_loss.logits, axis=1),
+              tf.expand_dims(decoder_step_state.atten_probs, axis=1),
+              lm_output=lm_output)
+          confidence_input = tf.concat(
+              [step_outs, tf.squeeze(confidence_features, axis=1)], axis=-1)
+          decoder_step_state.confidence_logits = tf.squeeze(
+              self.confidence.FProp(theta.confidence,
+                                    tf.stop_gradient(confidence_input)),
+              axis=1)
+
         # Update SequenceOutTensorArrays.
         new_seq_out_tas = self._UpdateSequenceOutTensorArrays(
             decoder_step_state, time, step_outs, seq_out_tas)
         del decoder_step_state.logits
+        if hasattr(decoder_step_state, 'confidence_logits'):
+          del decoder_step_state.confidence_logits
         return (time + 1, decoder_step_state, target_info_tas, new_seq_out_tas)
 
       loop_vars = time, decoder_step_state_zero, target_info_tas, seq_out_tas
       # NOTE(skyewm): this could be more specific, but for now don't verify
       # while_loop input/output shapes at all.
-      shape_invariants = tf.contrib.framework.nest.map_structure(
-          lambda t: tf.TensorShape(None), loop_vars)
+      shape_invariants = tf.nest.map_structure(lambda t: tf.TensorShape(None),
+                                               loop_vars)
 
       (time, _, target_info_tas, seq_out_tas) = tf.while_loop(
           _LoopContinue,
@@ -1003,6 +1055,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
 
       softmax_input = seq_out_tas.step_outs.stack()
       softmax_input = tf.transpose(softmax_input, [1, 0, 2])
+
       self._AddDecoderActivationsSummary(encoder_outputs, targets,
                                          seq_out_tas.atten_probs,
                                          seq_out_tas.rnn_outs, softmax_input)
@@ -1022,11 +1075,12 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
                                                      targets.ids, dec_bs)
 
       atten_context_dim = self._GetAttenContextDim()
-      out_dim = p.rnn_cell_dim + atten_context_dim
-      state0.step_outs = tf.zeros([dec_bs, out_dim],
-                                  dtype=py_utils.FPropDtype(p))
+      rnn_output_dim = self.rnn_cell[-1].params.num_output_nodes
+      out_dim = rnn_output_dim + atten_context_dim
+      state0.step_outs = py_utils.Zeros([dec_bs, out_dim],
+                                        dtype=py_utils.FPropDtype(p))
       target_embs = self.emb.EmbLookup(theta.emb, targets.ids)
-      target_embs = self._ApplyDropout(target_embs)
+      target_embs = self._ApplyDropout(theta, target_embs)
       inputs = py_utils.NestedMap(
           id=tf.transpose(targets.ids),
           label=tf.transpose(targets.labels),
@@ -1062,19 +1116,13 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
         state1 = self.PostStepDecoderStateUpdate(state1, inputs.label)
         return state1, py_utils.NestedMap()
 
-      accumulated_states, _ = recurrent.Recurrent(
-          recurrent_theta, state0_no_fusion, inputs, RnnStep)
-      # Give them names, so that they can be fetched in unit tests.
-      tf.identity(
-          accumulated_states.misc_states.step_state.global_step,
-          name='accumulated_global_steps')
-      tf.identity(
-          accumulated_states.misc_states.step_state.time_step,
-          name='accumulated_time_steps')
+      accumulated_states, _ = recurrent.Recurrent(recurrent_theta,
+                                                  state0_no_fusion, inputs,
+                                                  RnnStep)
 
       if not p.softmax_uses_attention:
         step_out, _ = tf.split(
-            accumulated_states.step_outs, [p.rnn_cell_dim, atten_context_dim],
+            accumulated_states.step_outs, [rnn_output_dim, atten_context_dim],
             axis=-1)
       else:
         step_out = accumulated_states.step_outs
@@ -1087,10 +1135,11 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       # TODO(syzhang): supports AddAdditionalDecoderSummaries().
       atten_states = accumulated_states.atten_states
       if isinstance(atten_states, py_utils.NestedMap):
-        additional_atten_probs = sorted(
-            [(name, tensor)
-             for name, tensor in atten_states.FlattenItems()
-             if name.endswith('probs')])
+        additional_atten_probs = sorted([
+            (name, tensor)
+            for name, tensor in atten_states.FlattenItems()
+            if name.endswith('probs')
+        ])
       else:
         additional_atten_probs = []
       rnn_outs = [
@@ -1108,11 +1157,42 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       # seq_logits: [time, batch, num_classes].
       adjusted_logits = self.fusion.ComputeLogitsWithLM(state0.fusion_states,
                                                         seq_logits)
+
+      # Forward confidence estimation module
+      if p.confidence is not None:
+        if p.lm_for_confidence:
+          lm_output = tf.transpose(state0.fusion_states.lm_output, [1, 0, 2])
+        else:
+          lm_output = None
+        confidence_features = self._ExtractConfidenceFeatures(
+            theta,
+            targets.labels,
+            tf.transpose(seq_logits, [1, 0, 2]),
+            tf.transpose(accumulated_states.atten_probs, [1, 0, 2]),
+            lm_output=lm_output)
+        confidence_input = tf.concat(
+            [tf.transpose(step_out, [1, 0, 2]), confidence_features], axis=-1)
+        confidence_logits = tf.squeeze(
+            self.confidence.FProp(theta.confidence,
+                                  tf.stop_gradient(confidence_input)),
+            axis=-1)
+
       predictions = py_utils.NestedMap(
           # Transpose to [batch, time, num_classes].
           logits_without_bias=tf.transpose(seq_logits, [1, 0, 2]),
-          logits=tf.transpose(adjusted_logits, [1, 0, 2]))
-      attention_map = py_utils.NestedMap(probs=accumulated_states.atten_probs)
+          logits=tf.transpose(adjusted_logits, [1, 0, 2]),
+          # softmax_input is of shape [time, batch, dim] for compatibility.
+          softmax_input=softmax_input)
+      if p.confidence is not None:
+        # confidence_logits is of shape [batch, time], pre-sigmoid values
+        predictions.confidence_logits = confidence_logits
+      attention_map = py_utils.NestedMap(
+          probs=accumulated_states.atten_probs,
+          contexts=accumulated_states.atten_context)
+      # Add LM logits [time, batch, dim] to predictions if exist
+      lm_output = state0.fusion_states.Get('lm_output', None)
+      if lm_output is not None:
+        predictions.lm_logits = tf.transpose(lm_output, [1, 0, 2])
       for k, v in additional_atten_probs:
         attention_map[k] = v
       # Transpose attention probs from [target_length, batch, source_length] to
@@ -1134,6 +1214,39 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
           class_ids=tf.ones(shape=tf.shape(softmax_input)[:-1], dtype=tf.int32))
       return xent_loss.logits
 
+  def _ExtractConfidenceFeatures(self,
+                                 theta,
+                                 labels,
+                                 logits,
+                                 atten_dists,
+                                 topk=5,
+                                 lm_output=None):
+    target_embs = self.emb.EmbLookup(theta.emb, labels)
+    target_dists = tf.nn.softmax(logits)
+    target_probs = py_utils.GetSoftmaxProbsBySeqIndices(
+        logits, labels, keepdims=True)
+    target_top_probs = tf.math.top_k(target_dists, k=topk)[0]
+    target_top_prob_mean = tf.math.reduce_mean(
+        target_top_probs, axis=-1, keepdims=True)
+    target_top_prob_std = tf.math.reduce_std(
+        target_top_probs, axis=-1, keepdims=True)
+    atten_probs = tf.math.reduce_max(atten_dists, axis=-1, keepdims=True)
+    atten_top_probs = tf.math.top_k(atten_dists, k=topk)[0]
+    atten_top_prob_mean = tf.math.reduce_mean(
+        atten_top_probs, axis=-1, keepdims=True)
+    atten_top_prob_std = tf.math.reduce_std(
+        atten_top_probs, axis=-1, keepdims=True)
+    confidence_features = tf.concat([
+        target_embs, target_probs, target_top_prob_mean, target_top_prob_std,
+        atten_probs, atten_top_prob_mean, atten_top_prob_std
+    ],
+                                    axis=-1)
+    if lm_output is not None:
+      lm_probs = py_utils.GetSoftmaxProbsBySeqIndices(
+          lm_output, labels, keepdims=True)
+      confidence_features = tf.concat([confidence_features, lm_probs], axis=-1)
+    return confidence_features
+
   def SingleDecodeStep(self,
                        theta,
                        packed_src,
@@ -1147,14 +1260,13 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     care of in sub-classes.
 
     Args:
-      theta: A NestedMap object containing weights' values of this
-        layer and its children layers.
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
       packed_src: A NestedMap to represent the packed source tensors generated
         by the attention model.
-      cur_target_info: TargetInfo namedtuple, which represents the targets
-        which represents information about the target at this step. It is up
-        to the various sub-classes to determine how to process the current
-        target.
+      cur_target_info: TargetInfo namedtuple, which represents the targets which
+        represents information about the target at this step. It is up to the
+        various sub-classes to determine how to process the current target.
       decoder_step_state: DecoderStepState which encapsulates the state of the
         decoder before computing outputs at the current step.
       per_step_src_padding: Optional padding to be applied to the source_encs
@@ -1171,23 +1283,28 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     # TODO(syzhang): unify the API to always pass in packed_src.
     raise NotImplementedError('Must be implemented by sub-classes.')
 
-  def MiscZeroState(self, encoder_outputs, target_ids, bs):
+  def MiscZeroState(self, theta, encoder_outputs, target_ids, bs):
     """Returns initial state for other miscellaneous states, if any."""
-    del encoder_outputs
-    misc_zero_state = py_utils.NestedMap(
-        step_state=py_utils.NestedMap(
-            global_step=py_utils.GetOrCreateGlobalStep(),
-            time_step=tf.constant(0, dtype=tf.int64)))
+    misc_zero_state = py_utils.NestedMap()
     p = self.params
     if self._max_label_prob > 0:
       misc_zero_state.prev_predicted_ids = tf.reshape(target_ids[:, 0], [bs])
-      step = tf.to_float(py_utils.GetOrCreateGlobalStep())
+      step = tf.cast(py_utils.GetGlobalStep(), tf.float32)
       sampling_p = (step - p.prob_decay_start_step) / self._decay_interval
       groundtruth_p = 1 - (self._max_label_prob * sampling_p)
       groundtruth_p = tf.maximum(groundtruth_p, p.min_ground_truth_prob)
       groundtruth_p = tf.minimum(groundtruth_p, 1.0)
       summary_utils.scalar('ground_truth_sampling_probability', groundtruth_p)
       misc_zero_state.groundtruth_p = groundtruth_p
+    if p.adapter_task_id_field:
+      # encoder_outputs.encoded: [time, batch, dim]
+      source_bs = py_utils.GetShape(encoder_outputs.encoded, 2)[1]
+      # Only task_ids of shape [batch] is supported
+      task_ids = tf.reshape(
+          encoder_outputs.Get(p.adapter_task_id_field), [source_bs])
+      multiplier = bs // source_bs
+      task_ids = tf.tile(task_ids, [multiplier])
+      misc_zero_state.Set(p.adapter_task_id_field, task_ids)
     return misc_zero_state
 
   def TargetsToBeFedAtCurrentDecodeStep(self, time, theta, decoder_step_state,
@@ -1205,7 +1322,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     if self._max_label_prob > 0:
       dec_bs = tf.shape(decoder_step_state.misc_states.prev_predicted_ids)[0]
       pick_groundtruth = tf.less(
-          tf.random_uniform([dec_bs], seed=self.params.random_seed),
+          tf.random.uniform([dec_bs], seed=self.params.random_seed),
           decoder_step_state.misc_states.groundtruth_p)
       emb = tf.where(
           pick_groundtruth, target_info_tas.emb.read(time),
@@ -1253,10 +1370,8 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
         log_prob_sample = tf.multinomial(
             log_probs, 1, seed=self.params.random_seed)
         # pred_ids: [bs]
-        pred_ids = tf.reshape(tf.to_int32(log_prob_sample), [bs])
+        pred_ids = tf.reshape(tf.cast(log_prob_sample, tf.int32), [bs])
         decoder_step_state.misc_states.prev_predicted_ids = pred_ids
-
-    decoder_step_state.misc_states.step_state.time_step += 1
     return decoder_step_state
 
 
@@ -1265,7 +1380,10 @@ class AsrDecoder(AsrDecoderBase):
 
   @classmethod
   def Params(cls):
-    p = super(AsrDecoder, cls).Params()
+    p = super().Params()
+    p.Define(
+        'teacher_forcing', True, 'If True, at each RNN step we consume '
+        'the previous target label.  If False, we instead consume zeros.')
     return p
 
   def AddAdditionalDecoderSummaries(self, encoder_outputs, targets, seq_out_tas,
@@ -1279,9 +1397,10 @@ class AsrDecoder(AsrDecoderBase):
       softmax_input: a tensor of shape [batch, time, vocab_size].
     """
     if cluster_factory.Current().add_summary:
-      self.fusion.AddAdditionalDecoderSummaries(
-          encoder_outputs.encoded, encoder_outputs.padding, targets,
-          seq_out_tas, softmax_input)
+      self.fusion.AddAdditionalDecoderSummaries(encoder_outputs.encoded,
+                                                encoder_outputs.padding,
+                                                targets, seq_out_tas,
+                                                softmax_input)
 
   def _ComputeAttention(self,
                         theta,
@@ -1289,7 +1408,6 @@ class AsrDecoder(AsrDecoderBase):
                         packed_src,
                         attention_state,
                         per_step_src_padding=None,
-                        step_state=None,
                         query_segment_id=None):
     """Runs attention and computes context vector.
 
@@ -1298,19 +1416,17 @@ class AsrDecoder(AsrDecoderBase):
     Args:
       theta: A NestedMap object containing weights for the attention layers.
         Expects a member named 'atten'.
-      rnn_out: A Tensor of shape [batch_size, query_dim]; output of the
-        first layer of decoder RNN, which is the query vector used for
-        attention.
+      rnn_out: A Tensor of shape [batch_size, query_dim]; output of the first
+        layer of decoder RNN, which is the query vector used for attention.
       packed_src: A NestedMap returned by self.atten.InitForSourcePacked.
       attention_state: The attention state computed at the previous timestep.
         Varies with the type of attention, but is usually a Tensor or a
         NestedMap of Tensors of shape [batch_size, <state_dim>].
       per_step_src_padding: Source sequence padding to apply at this step.
-      step_state: A NestedMap containing 'global_step' and 'time_step'.
       query_segment_id: a tensor of shape [batch_size].
 
     Returns:
-      A 3-tuple:
+      A tuple of 3 tensors:
 
       - The attention context vector: shaped [batch_size, context_dim].
       - The attention probability vector: shaped [batch_size, seq_len]
@@ -1323,7 +1439,6 @@ class AsrDecoder(AsrDecoderBase):
         rnn_out,
         attention_state=attention_state,
         per_step_source_padding=per_step_src_padding,
-        step_state=step_state,
         query_segment_id=query_segment_id)
 
   def SingleDecodeStep(self,
@@ -1340,14 +1455,13 @@ class AsrDecoder(AsrDecoderBase):
     https://arxiv.org/pdf/1703.08581.pdf.
 
     Args:
-      theta: A NestedMap object containing weights' values of this
-        layer and its children layers.
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
       packed_src: A NestedMap to represent the packed source tensors generated
         by the attention model.
-      cur_target_info: TargetInfo namedtuple, which represents the targets
-        which represents information about the target at this step. It is up
-        to the various sub-classes to determine how to process the current
-        target.
+      cur_target_info: TargetInfo namedtuple, which represents the targets which
+        represents information about the target at this step. It is up to the
+        various sub-classes to determine how to process the current target.
       decoder_step_state: DecoderStepState which encapsulates the state of the
         decoder before computing outputs at the current step.
       per_step_src_padding: Optional padding to be applied to the source_encs
@@ -1361,15 +1475,27 @@ class AsrDecoder(AsrDecoderBase):
       decoder (usually logits), and the new decoder state after processing the
       current step.
     """
+    p = self.params
+    if p.teacher_forcing:
+      prev_embs = cur_target_info.emb
+    else:
+      prev_embs = tf.ones_like(cur_target_info.emb)
+
     misc_states = decoder_step_state.misc_states
     new_rnn_states = []
     new_rnn_states_0, _ = self.rnn_cell[0].FProp(
         theta.rnn_cell[0], decoder_step_state.rnn_states[0],
         py_utils.NestedMap(
-            act=[cur_target_info.emb, decoder_step_state.atten_context],
+            act=[prev_embs, decoder_step_state.atten_context],
             padding=cur_target_info.padding))
     new_rnn_states.append(new_rnn_states_0)
     rnn_out = self.rnn_cell[0].GetOutput(new_rnn_states_0)
+    if p.adapter_task_id_field:
+      # rnn_out is [batch, dim], adapter layers requires [time, batch, dim]
+      rnn_out = self.adapters[0].FProp(theta.adapters[0],
+                                       tf.expand_dims(rnn_out, [0]),
+                                       misc_states.Get(p.adapter_task_id_field))
+      rnn_out = tf.squeeze(rnn_out, [0])
 
     (new_atten_context, new_atten_probs,
      new_atten_states) = self._ComputeAttention(
@@ -1377,8 +1503,7 @@ class AsrDecoder(AsrDecoderBase):
          rnn_out,
          packed_src,
          decoder_step_state.atten_states,
-         per_step_src_padding=per_step_src_padding,
-         step_state=misc_states.step_state)
+         per_step_src_padding=per_step_src_padding)
     # Here the attention context is being updated according to the
     # contextualizer (the default contextualizer is a no-op).
     new_atten_context = self.contextualizer.QueryAttention(
@@ -1392,12 +1517,16 @@ class AsrDecoder(AsrDecoderBase):
               padding=cur_target_info.padding))
       new_rnn_states.append(new_rnn_states_i)
       new_rnn_out = cell.GetOutput(new_rnn_states_i)
+      if p.adapter_task_id_field:
+        new_rnn_out = self.adapters[i].FProp(
+            theta.adapters[i], tf.expand_dims(new_rnn_out, [0]),
+            misc_states.Get(p.adapter_task_id_field))
+        new_rnn_out = tf.squeeze(new_rnn_out, [0])
       new_rnn_out = self._ApplyDropout(
+          theta,
           new_rnn_out,
           deterministic=use_deterministic_random,
-          # Use i * 1000 as extra seed to make dropout at every layer different.
-          extra_seed=i * 1000,
-          step_state=misc_states.step_state)
+          extra_seed=i * 1000)
       if i + 1 >= self.params.residual_start > 0:
         rnn_out += new_rnn_out
       else:
@@ -1419,8 +1548,9 @@ class AsrDecoder(AsrDecoderBase):
     hyps are to be computed in a different way, e.g., when the format of inputs
     change.
     Args:
-      source_encs: A Tensor of [dim, batch] dimension with source encodings.
+      source_encs: A Tensor of [time, batch, dim] with source encodings.
       num_hyps_per_beam: Int, the number of hypothesis per example in the beam.
+
     Returns:
       A Tensor with value batch * num_hyps_per_beam.
     """
@@ -1433,6 +1563,7 @@ class AsrDecoder(AsrDecoderBase):
     by a child class, e.g., when the format of probabilities change.
     Args:
       atten_probs: A Tensor of [batch, source_len] dimension with atten probs.
+
     Returns:
       A Tensor with processed atten_probs. The same as input in this case.
     """
@@ -1443,9 +1574,9 @@ class AsrDecoder(AsrDecoderBase):
     p = self.params
     num_hyps = self._GetNumHypsForBeamSearch(encoder_outputs.encoded,
                                              num_hyps_per_beam)
-    (rnn_states, atten_context, atten_probs, atten_states,
-     fusion_states, misc_states, packed_src) = self.InitDecoder(
-         theta, encoder_outputs, num_hyps)
+    (rnn_states, atten_context, atten_probs, atten_states, fusion_states,
+     misc_states, packed_src) = self.InitDecoder(theta, encoder_outputs,
+                                                 num_hyps)
     # Throw away packed_src. We re-compute it in _PreBeamSearchStepCallback
     # because we cannot pass 'packed_src' through 'states'. beam_search_helper
     # assumes that all Tensors in 'states' have 'target_batch' as the first
@@ -1467,6 +1598,7 @@ class AsrDecoder(AsrDecoderBase):
             atten_probs,
     })
     other_states = py_utils.NestedMap({
+        'time_step': tf.constant(0),
         'rnn_states': rnn_states,
         'all_atten_states': all_atten_states,
         'fusion_states': fusion_states,
@@ -1475,7 +1607,7 @@ class AsrDecoder(AsrDecoderBase):
     return initial_results, other_states
 
   def _PreBeamSearchStepCallback(self, theta, encoder_outputs, step_ids, states,
-                                 num_hyps_per_beam):
+                                 num_hyps_per_beam, cur_step):
     p = self.params
     step_paddings = tf.zeros(tf.shape(step_ids), dtype=p.dtype)
     embs = self.emb.EmbLookup(theta.emb, tf.reshape(step_ids, [-1]))
@@ -1525,12 +1657,14 @@ class AsrDecoder(AsrDecoderBase):
       # AsrDecoderBase.ComputePredictionsFunctional().RnnStep().  Refactor the
       # code so as to remove this assumption.
       atten_context_dim = self._GetAttenContextDim()
+      rnn_output_dim = self.rnn_cell[-1].params.num_output_nodes
       softmax_input, _ = tf.split(
-          step_out, [p.rnn_cell_dim, atten_context_dim], axis=-1)
+          step_out, [rnn_output_dim, atten_context_dim], axis=-1)
 
+    misc = py_utils.NestedMap(cur_step=cur_step)
     softmax_input, fusion_states = self.fusion.FProp(
         theta.fusion, prev_fusion_states, softmax_input, cur_target_info.id,
-        cur_target_info.padding)
+        cur_target_info.padding, misc)
 
     logits = self._ComputeLogits(theta, softmax_input)
     logits = self.fusion.ComputeLogitsWithLM(
@@ -1551,6 +1685,7 @@ class AsrDecoder(AsrDecoderBase):
         'atten_states': atten_states,
     })
     new_states = py_utils.NestedMap({
+        'time_step': states.time_step + 1,
         'rnn_states': rnn_states,
         'all_atten_states': all_atten_states,
         'fusion_states': fusion_states,

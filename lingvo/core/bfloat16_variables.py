@@ -38,95 +38,8 @@ Usage:
 
       # bfloat16_var is now loaded from the checkpoint.
 """
-import tensorflow as tf
+import lingvo.compat as tf
 from tensorflow.python.training import saver
-
-
-def quantization_noise_from_step_num():
-  """A quantization noise equal to (phi * (step_num + 1)) mod 1.0.
-
-  quantization_noise is a float32 scalar in [0, 1). quantization_noise should
-  take different values across different steps, approximating a uniform
-  distribution over [0, 1).
-
-  In the case of replicated TPU training, quantization_noise should be identical
-  across replicas in order to keep the parameters identical across replicas.
-  The natural choice for quantization_noise would be tf.random_uniform(),
-  but this is not possible for TPU, since there is currently no way to seed
-  the different cores to produce identical values across replicas. Instead we
-  use this quantization_noise_from_step_num() to generate noise.
-
-  Returns:
-    a float32 scalar
-  """
-  step = tf.to_int32(tf.train.get_or_create_global_step()) + 1
-  phi = ((5**0.5) - 1) / 2
-  # Naive computation tf.mod(phi * step, 1.0) in float32 would be disastrous
-  # due to loss of precision when the step number gets large.
-  # Computation in doubles does not work on TPU, so we use this complicated
-  # alternative computation which does not suffer from these roundoff errors.
-  ret = 0.0
-  for i in xrange(30):
-    ret += (((phi * (2**i)) % 1.0)  # double-precision computation in python
-            * tf.to_float(tf.mod(step // (2**i), 2)))
-  return tf.mod(ret, 1.0)
-
-
-def randomized_roundoff_to_bfloat16(x, quantization_noise, cand1, cand2):
-  """Round-off x to cand1 or to cand2 in an unbiased way.
-
-  Cand1 and cand2 are the same shape as x.
-  For every element of x, the corresponding elements of cand1 and cand2 should
-  be the two closest bfloat16 values to x.  Order does not matter.
-  cand1 and cand2 must differ from each other.
-
-  Args:
-    x: A float32 Tensor.
-    quantization_noise: A Tensor broadcastable to the shape of x containing
-      random uniform values in [0.0, 1.0].
-    cand1: A bfloat16 Tensor the same shape as x.
-    cand2: A bfloat16 Tensor the same shape as x.
-
-  Returns:
-    A bfloat16 Tensor.
-  """
-  cand1_f = tf.to_float(cand1)
-  cand2_f = tf.to_float(cand2)
-  step_size = cand2_f - cand1_f
-  fpart = (x - cand1_f) / step_size
-  ret = tf.where(tf.greater(fpart, quantization_noise), cand2, cand1)
-  return ret
-
-
-def to_bfloat16_unbiased(x, quantization_noise=None):
-  """Convert a float32 to a bfloat16 using randomized roundoff.
-
-  The current implementation uses quantization_noise_from_step_num to generate
-  quantization_noise, which requires global_step, and is not deterministic.
-  To use it for inference, it might be feasible to replace the noise generation
-  function with a constant, e.g., 0.5.
-
-  Args:
-    x: A float32 Tensor.
-    quantization_noise: A float, specifying the quantization noise.
-
-  Returns:
-    A bfloat16 Tensor, with the same shape as x.
-  """
-  if quantization_noise is None:
-    quantization_noise = quantization_noise_from_step_num()
-  x_sign = tf.sign(x)
-  # Make sure x is positive.  If it is zero, the two candidates are identical.
-  x = x * x_sign + 1e-30
-  cand1 = tf.to_bfloat16(x)
-  cand1_f = tf.to_float(cand1)
-  # This relies on the fact that for a positive bfloat16 b,
-  # b * 1.005 gives you the next higher bfloat16 and b*0.995 gives you the
-  # next lower one. Both 1.005 and 0.995 are ballpark estimation.
-  cand2 = tf.to_bfloat16(
-      tf.where(tf.greater(x, cand1_f), cand1_f * 1.005, cand1_f * 0.995))
-  ret = randomized_roundoff_to_bfloat16(x, quantization_noise, cand1, cand2)
-  return ret * tf.to_bfloat16(x_sign)
 
 
 class Bfloat16VariableSaveable(saver.BaseSaverBuilder.SaveableObject):
@@ -139,8 +52,12 @@ class Bfloat16VariableSaveable(saver.BaseSaverBuilder.SaveableObject):
       return var
 
     spec = saver.BaseSaverBuilder.SaveSpec(
-        _make_callable_var, slice_spec, name, dtype=orig_dtype)
-    super(Bfloat16VariableSaveable, self).__init__(var, [spec], name)
+        _make_callable_var,
+        slice_spec,
+        name,
+        dtype=orig_dtype,
+        device=var.device)
+    super().__init__(var, [spec], name)
 
   def restore(self, restored_tensors, restored_shapes):
     restored_tensor = restored_tensors[0]
@@ -153,19 +70,25 @@ class Bfloat16VariableSaveable(saver.BaseSaverBuilder.SaveableObject):
         self.op.get_shape().is_fully_defined())
 
 
-def get_saver_spec_for_variables_with_bf16_overrides(variables_to_restore):
+def get_saver_spec_for_variables_with_bf16_overrides(
+    variables_to_restore: dict[str, tf.Variable], bf16_ckpt: bool = False
+) -> dict[str, tf.Variable]:
   """Returns a dictionary containing overrides to load variables as bf16.
 
   Args:
     variables_to_restore: A mapping from variable to name (on checkpoint) to the
       Variable object.
+    bf16_ckpt: Whether the checkpoint is of type bfloat16.
 
   Returns:
     A saver dictionary which can be used to load from checkpoints.
   """
   saver_dict = {}
   for var_name, v in variables_to_restore.items():
-    if v.dtype == tf.bfloat16:
+    # If the ckpt is of type bfloat16, the variables dtype should be bfloat16.
+    # We don't need Bfloat16VariableSaveable to cast the float32 ckpt value to
+    # bfloat16.
+    if v.dtype == tf.bfloat16 and not bf16_ckpt:
       # TODO(rohananil): Add support for PartitionedVariables if there is
       # demand.
       savable = Bfloat16VariableSaveable(v, tf.float32, '', var_name)

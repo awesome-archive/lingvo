@@ -20,6 +20,7 @@ package tensorflow.lingvo;
 import "google/protobuf/any.proto";
 import "tensorflow/core/framework/graph.proto";
 import "tensorflow/core/framework/types.proto";
+import "tensorflow/core/protobuf/meta_graph.proto";
 import "tensorflow/core/protobuf/saver.proto";
 
 // Represents a frozen graph constructed at training time which can be used with
@@ -92,7 +93,7 @@ message InferenceGraph {
     //   t=time, b=batch, d=depth, f=feature, c=channel, 1=single
     // Examples:
     //   'tbd': time-batch-depth
-    //   'btd': batch-depth-time
+    //   'btd': batch-time-depth
     //   'btfc': batch-time-feature-channel
     optional string layout = 4;
 
@@ -119,4 +120,8 @@ message InferenceGraph {
   }
 
   reserved 3, 4, 6;  // deprecated fields.
+
+  repeated tensorflow.AssetFileDef asset_file_def = 10;
+
+  map<string, tensorflow.CollectionDef> collection_def = 11;
 }

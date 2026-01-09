@@ -14,15 +14,11 @@
 # ==============================================================================
 """Downloads and processes the Brown Corpus (http://www.nltk.org/nltk_data)."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
 import random
 import string
 from xml.etree import ElementTree
-import tensorflow as tf
+import lingvo.compat as tf
 
 tf.flags.DEFINE_string("outdir", "/tmp/punctuator_data",
                        "The output directory.")

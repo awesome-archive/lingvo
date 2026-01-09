@@ -14,21 +14,15 @@
 # ==============================================================================
 """Tests for asr frontend."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import numpy as np
-
-import tensorflow as tf
-
-from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
+import lingvo.compat as tf
 from lingvo.core import py_utils
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.tasks.asr import frontend
+import numpy as np
 
 
-class AsrFrontendTest(tf.test.TestCase):
+class AsrFrontendTest(test_utils.TestCase):
 
   def _GetPcm(self):
     """Gets sample wav file pcm samples.
@@ -39,9 +33,9 @@ class AsrFrontendTest(tf.test.TestCase):
     """
     with open(
         test_helper.test_src_dir_path('tools/testdata/gan_or_vae.wav'),
-        'r') as f:
+        'rb') as f:
       wavdata = f.read()
-      result = contrib_audio.decode_wav(wavdata)
+      result = tf.audio.decode_wav(wavdata)
       # Remove the last dimension: channel is 1.
       audio = py_utils.HasShape(result.audio, [75900, 1])
       audio = tf.squeeze(audio, axis=1)
@@ -53,12 +47,12 @@ class AsrFrontendTest(tf.test.TestCase):
     p.sample_rate = 24000.
     p.num_bins = 2
     p.noise_scale = 0.
-    self.params = p
+    return p
 
   def testNullAsrFrontendConfig(self):
     p = frontend.NullAsrFrontend.Params()
     p.name = 'null'
-    fe = p.cls(p)
+    fe = p.Instantiate()
     config = fe.config
     self.assertTrue(config.is_null)
     self.assertEqual(config.src_type, 'none')
@@ -66,9 +60,8 @@ class AsrFrontendTest(tf.test.TestCase):
     self.assertEqual(config.input_frame_ratio, 1.0)
 
   def testMelFeaturesUnstackedConfig(self):
-    self._CreateFrontendParams()
-    p = self.params
-    fe = p.cls(p)
+    p = self._CreateFrontendParams()
+    fe = p.Instantiate()
     config = fe.config
     self.assertFalse(config.is_null)
     self.assertEqual(config.src_type, 'pcm')
@@ -79,10 +72,10 @@ class AsrFrontendTest(tf.test.TestCase):
     self.assertEqual(config.input_frame_ratio, 480.0)
 
   def testMelFeaturesLeftStackedConfig(self):
-    self._CreateFrontendParams()
-    p = self.params
+    p = self._CreateFrontendParams()
     p.stack_left_context = 2
-    fe = p.cls(p)
+    p.frame_stride = p.stack_left_context + 1
+    fe = p.Instantiate()
     config = fe.config
     self.assertFalse(config.is_null)
     self.assertEqual(config.src_type, 'pcm')
@@ -92,10 +85,19 @@ class AsrFrontendTest(tf.test.TestCase):
     # Approx 12 output frames per second.
     self.assertEqual(config.input_frame_ratio, 1440.0)
 
+  def testMelFeaturesLeftRightStackedConfig(self):
+    p = self._CreateFrontendParams()
+    p.stack_right_context = 2
+    p.stack_left_context = 2
+    p.frame_stride = p.stack_right_context + p.stack_left_context + 1
+    fe = p.Instantiate()
+    config = fe.config
+    # Approx 6 output frames per second.
+    self.assertEqual(config.input_frame_ratio, 2400.0)
+
   def testMelFeaturesUnstacked(self):
-    self._CreateFrontendParams()
-    p = self.params
-    mel_frontend = p.cls(p)
+    p = self._CreateFrontendParams()
+    mel_frontend = p.Instantiate()
     sample_rate, pcm = self._GetPcm()
     pcm *= 32768
 
@@ -110,12 +112,12 @@ class AsrFrontendTest(tf.test.TestCase):
         py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
     log_mel = outputs.src_inputs
     paddings = outputs.paddings
-    with self.session() as sess:
-      pcm = sess.run(pcm)
+    with self.session():
+      pcm = self.evaluate(pcm)
       tf.logging.info('pcm: ~ %s = %s', pcm.shape, pcm)
       self.assertGreater(33000, np.amax(pcm))
       self.assertGreater(np.amax(pcm), 2.)
-      log_mel, paddings, sample_rate = sess.run(
+      log_mel, paddings, sample_rate = self.evaluate(
           [log_mel, paddings, sample_rate])
       self.assertEqual(sample_rate, p.sample_rate)
       self.assertEqual(paddings.shape, log_mel.shape[0:2])
@@ -137,11 +139,39 @@ class AsrFrontendTest(tf.test.TestCase):
       self.assertAllClose(mu, ref_unstacked_mean, atol=1e-4)
       self.assertAllClose(s, ref_unstacked_stddev, atol=1e-3)
 
+  def testMelFeaturesNotEmphasized(self):
+    p = self._CreateFrontendParams()
+    mel_frontend = p.Instantiate()
+    not_emphasized_p = p.Copy()
+    not_emphasized_p.preemph = 0.
+    not_emphasized_mel_frontend = not_emphasized_p.Instantiate()
+
+    _, pcm = self._GetPcm()
+    pcm *= 32768
+
+    # Convert to 4D [batch, time, packet, channels].
+    sample_count = tf.shape(pcm)[1]
+    packet_size = 11  # A non-round number.
+    trimmed_pcm = pcm[:, 0:(sample_count // packet_size) * packet_size]
+    src_inputs = tf.reshape(trimmed_pcm, (1, -1, packet_size, 1))
+    paddings = tf.zeros(tf.shape(src_inputs)[0:2])
+
+    outputs = mel_frontend.FPropDefaultTheta(
+        py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
+    not_emphasized_outputs = not_emphasized_mel_frontend.FPropDefaultTheta(
+        py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
+    log_mel = outputs.src_inputs
+    not_emphasized_log_mel = not_emphasized_outputs.src_inputs
+    with self.session():
+      log_mel, not_emphasized_log_mel = self.evaluate(
+          [log_mel, not_emphasized_log_mel])
+      self.assertEqual(log_mel.shape, not_emphasized_log_mel.shape)
+
   def testMelFeaturesLeftStacked(self):
-    self._CreateFrontendParams()
-    p = self.params
+    p = self._CreateFrontendParams()
     p.stack_left_context = 2
-    mel_frontend = p.cls(p)
+    p.frame_stride = p.stack_left_context + 1
+    mel_frontend = p.Instantiate()
     sample_rate, pcm = self._GetPcm()
     pcm *= 32768
 
@@ -156,12 +186,12 @@ class AsrFrontendTest(tf.test.TestCase):
         py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
     log_mel = outputs.src_inputs
     paddings = outputs.paddings
-    with self.session() as sess:
-      pcm = sess.run(pcm)
+    with self.session():
+      pcm = self.evaluate(pcm)
       tf.logging.info('pcm: ~ %s = %s', pcm.shape, pcm)
       self.assertGreater(33000, np.amax(pcm))
       self.assertGreater(np.amax(pcm), 2.)
-      log_mel, paddings, sample_rate = sess.run(
+      log_mel, paddings, sample_rate = self.evaluate(
           [log_mel, paddings, sample_rate])
       self.assertEqual(sample_rate, p.sample_rate)
       self.assertEqual(paddings.shape, log_mel.shape[0:2])
@@ -184,11 +214,58 @@ class AsrFrontendTest(tf.test.TestCase):
       self.assertAllClose(mu, ref_mean, atol=1e-4)
       self.assertAllClose(s, ref_stddev, atol=1e-3)
 
+  def testMelFeaturesRightStacked(self):
+    p = self._CreateFrontendParams()
+    p.stack_right_context = 2
+    p.frame_stride = p.stack_right_context + 1
+    mel_frontend = p.Instantiate()
+    sample_rate, pcm = self._GetPcm()
+    pcm *= 32768
+
+    # Convert to 4D [batch, time, packet, channels].
+    sample_count = tf.shape(pcm)[1]
+    packet_size = 11  # A non-round number.
+    trimmed_pcm = pcm[:, 0:(sample_count // packet_size) * packet_size]
+    src_inputs = tf.reshape(trimmed_pcm, (1, -1, packet_size, 1))
+    paddings = tf.zeros(tf.shape(src_inputs)[0:2])
+
+    outputs = mel_frontend.FPropDefaultTheta(
+        py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
+    log_mel = outputs.src_inputs
+    paddings = outputs.paddings
+    with self.session():
+      pcm = self.evaluate(pcm)
+      tf.logging.info('pcm: ~ %s = %s', pcm.shape, pcm)
+      self.assertGreater(33000, np.amax(pcm))
+      self.assertGreater(np.amax(pcm), 2.)
+      log_mel, paddings, sample_rate = self.evaluate(
+          [log_mel, paddings, sample_rate])
+      self.assertEqual(sample_rate, p.sample_rate)
+      self.assertEqual(paddings.shape, log_mel.shape[0:2])
+      self.assertAllEqual(paddings, np.zeros_like(paddings))
+      # log_mel ~ [batch, time, feature_size, channel]
+      tf.logging.info('mel ~ %s', log_mel.shape)
+      # Squeeze the batch and channel dimensions out.
+      log_mel = np.squeeze(log_mel, axis=(0, 3))
+      t = log_mel.shape[0]
+      mu = np.sum(log_mel, axis=0) / t
+      d = log_mel - mu
+      v = np.sum(d * d, axis=0) / (t - 1)
+      s = np.sqrt(v)
+      tf.logging.info('Found mean = %s', mu)
+      tf.logging.info('Found stddev = %s', s)
+      ref_mean = (13.46731281, 13.31649303, 13.41263676, 13.28540039,
+                  13.48256969, 13.2802248)
+      ref_stddev = (1.41251481, 1.28583682, 1.43964291, 1.23710775, 1.32300735,
+                    1.23345602)
+      self.assertAllClose(mu, ref_mean, atol=1e-4)
+      self.assertAllClose(s, ref_stddev, atol=1e-3)
+
   def testMelFeaturesPaddedLeftStacked(self):
-    self._CreateFrontendParams()
-    p = self.params
+    p = self._CreateFrontendParams()
     p.stack_left_context = 2
-    mel_frontend = p.cls(p)
+    p.frame_stride = p.stack_left_context + 1
+    mel_frontend = p.Instantiate()
     sample_rate, pcm = self._GetPcm()
     pcm *= 32768
 
@@ -213,12 +290,12 @@ class AsrFrontendTest(tf.test.TestCase):
         py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
     log_mel = outputs.src_inputs
     paddings = outputs.paddings
-    with self.session() as sess:
-      pcm = sess.run(pcm)
+    with self.session():
+      pcm = self.evaluate(pcm)
       tf.logging.info('pcm: ~ %s = %s', pcm.shape, pcm)
       self.assertGreater(33000, np.amax(pcm))
       self.assertGreater(np.amax(pcm), 2.)
-      log_mel, paddings, sample_rate = sess.run(
+      log_mel, paddings, sample_rate = self.evaluate(
           [log_mel, paddings, sample_rate])
       self.assertEqual(sample_rate, p.sample_rate)
       self.assertEqual(paddings.shape, log_mel.shape[0:2])
@@ -244,17 +321,62 @@ class AsrFrontendTest(tf.test.TestCase):
       self.assertAllClose(mu, ref_mean, atol=1e-4)
       self.assertAllClose(s, ref_stddev, atol=1e-3)
 
+  def testMelFeaturesPaddedRightStacked(self):
+    p = self._CreateFrontendParams()
+    p.stack_right_context = 2
+    p.frame_stride = p.stack_right_context + 1
+    mel_frontend = p.Instantiate()
+    sample_rate, pcm = self._GetPcm()
+    pcm *= 32768
+
+    # Convert to 4D [batch, time, packet, channels].
+    sample_count = tf.shape(pcm)[1]
+    packet_size = 11  # A non-round number.
+    trimmed_pcm = pcm[:, 0:(sample_count // packet_size) * packet_size]
+    src_inputs = tf.reshape(trimmed_pcm, (1, -1, packet_size, 1))
+
+    # Create paddings such that the first 455 packets are unpadded.
+    paddings = tf.concat([
+        tf.zeros([1, 455], dtype=tf.float32),
+        tf.ones([1, tf.shape(src_inputs)[1] - 455], dtype=tf.float32)
+    ],
+                         axis=1)
+    # frame_step=240, frame_size=600, +1200 right padded frames
+    # 455 packets * 11 frames rounds = 5005 frames, rounds down to 21 mel
+    # frames. Divide by 3 for stacking = 7.
+    # TODO(talremez): Make sure with this makes sense.
+    expected_unpadded = 6
+
+    outputs = mel_frontend.FPropDefaultTheta(
+        py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
+    log_mel = outputs.src_inputs
+    paddings = outputs.paddings
+
+    with self.session():
+      pcm = self.evaluate(pcm)
+      tf.logging.info('pcm: ~ %s = %s', pcm.shape, pcm)
+      self.assertGreater(33000, np.amax(pcm))
+      self.assertGreater(np.amax(pcm), 2.)
+      log_mel, paddings, sample_rate = self.evaluate(
+          [log_mel, paddings, sample_rate])
+      self.assertEqual(sample_rate, p.sample_rate)
+      self.assertEqual(paddings.shape, log_mel.shape[0:2])
+      self.assertAllEqual(paddings[:, 0:expected_unpadded],
+                          np.zeros([1, expected_unpadded]))
+      self.assertAllEqual(paddings[:, expected_unpadded:],
+                          np.ones([1, paddings.shape[1] - expected_unpadded]))
+
   def testMelMeanVarNormalization(self):
-    self._CreateFrontendParams()
-    p = self.params
+    p = self._CreateFrontendParams()
     p.stack_left_context = 2
+    p.frame_stride = p.stack_left_context + 1
     ref_mean = (13.38236332, 13.2698698, 13.45229626, 13.26469517, 13.46731281,
                 13.31649303)
     ref_stddev = (1.52104115, 1.27433181, 1.41266346, 1.27072334, 1.41251481,
                   1.28583682)
     p.per_bin_mean = ref_mean[:p.num_bins]
     p.per_bin_stddev = ref_stddev[:p.num_bins]
-    mel_frontend = p.cls(p)
+    mel_frontend = p.Instantiate()
     _, pcm = self._GetPcm()
     pcm *= 32768
 
@@ -268,8 +390,8 @@ class AsrFrontendTest(tf.test.TestCase):
     outputs = mel_frontend.FPropDefaultTheta(
         py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
     log_mel = outputs.src_inputs
-    with self.session() as sess:
-      log_mel = sess.run(log_mel)
+    with self.session():
+      log_mel = self.evaluate(log_mel)
       # log_mel ~ [batch, time, feature_size, channel]
       tf.logging.info('mel ~ %s', log_mel.shape)
       # Squeeze the batch and channel dimensions out.
@@ -287,9 +409,8 @@ class AsrFrontendTest(tf.test.TestCase):
 
   def testMelFeaturesUnstacked2D(self):
     # TODO(laurenzo): Remove this test once 2D inputs support removed.
-    self._CreateFrontendParams()
-    p = self.params
-    mel_frontend = p.cls(p)
+    p = self._CreateFrontendParams()
+    mel_frontend = p.Instantiate()
     sample_rate, pcm = self._GetPcm()
     pcm *= 32768
 
@@ -301,12 +422,12 @@ class AsrFrontendTest(tf.test.TestCase):
         py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
     log_mel = outputs.src_inputs
     paddings = outputs.paddings
-    with self.session() as sess:
-      pcm = sess.run(pcm)
+    with self.session():
+      pcm = self.evaluate(pcm)
       tf.logging.info('pcm: ~ %s = %s', pcm.shape, pcm)
       self.assertGreater(33000, np.amax(pcm))
       self.assertGreater(np.amax(pcm), 2.)
-      log_mel, paddings, sample_rate = sess.run(
+      log_mel, paddings, sample_rate = self.evaluate(
           [log_mel, paddings, sample_rate])
       self.assertEqual(sample_rate, p.sample_rate)
       self.assertEqual(paddings.shape, log_mel.shape[0:2])
@@ -330,9 +451,8 @@ class AsrFrontendTest(tf.test.TestCase):
 
   def testMelFeaturesUnstacked3D(self):
     # TODO(laurenzo): Remove this test once 3D inputs support removed.
-    self._CreateFrontendParams()
-    p = self.params
-    mel_frontend = p.cls(p)
+    p = self._CreateFrontendParams()
+    mel_frontend = p.Instantiate()
     sample_rate, pcm = self._GetPcm()
     pcm *= 32768
 
@@ -344,12 +464,12 @@ class AsrFrontendTest(tf.test.TestCase):
         py_utils.NestedMap(src_inputs=src_inputs, paddings=paddings))
     log_mel = outputs.src_inputs
     paddings = outputs.paddings
-    with self.session() as sess:
-      pcm = sess.run(pcm)
+    with self.session():
+      pcm = self.evaluate(pcm)
       tf.logging.info('pcm: ~ %s = %s', pcm.shape, pcm)
       self.assertGreater(33000, np.amax(pcm))
       self.assertGreater(np.amax(pcm), 2.)
-      log_mel, paddings, sample_rate = sess.run(
+      log_mel, paddings, sample_rate = self.evaluate(
           [log_mel, paddings, sample_rate])
       self.assertEqual(sample_rate, p.sample_rate)
       self.assertEqual(paddings.shape, log_mel.shape[0:2])
@@ -373,4 +493,4 @@ class AsrFrontendTest(tf.test.TestCase):
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()

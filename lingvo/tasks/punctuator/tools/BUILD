@@ -1,13 +1,13 @@
-package(
-    default_visibility = ["//visibility:public"],
-)
+# Placeholder: load py_binary
 
-licenses(["notice"])  # Apache 2.0
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
 
 py_binary(
     name = "download_brown_corpus",
     srcs = ["download_brown_corpus.py"],
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
     ],
 )

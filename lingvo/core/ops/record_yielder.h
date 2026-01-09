@@ -24,16 +24,39 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_format.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
+#include "lingvo/core/ops/rope.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/thread_annotations.h"
-#include "lingvo/core/ops/mutex.h"
-#include "lingvo/core/ops/rope.h"
 
 namespace tensorflow {
 namespace lingvo {
+
+// TODO(oday): Separate some constants and Record to other file.
+// TODO(oday): Change "source_id" to another appropriate name, because this is
+// one of the typically used symbols in some tasks (e.g., NMTExample has such
+// field for source tokens).
+
+constexpr int kDefaultSourceId = 0;
+
+// A data structure representing a record with its context information.
+// TODO(oday): The typename may sound too simple to represent itself. Consider
+// to revise it if it may become really problematic.
+struct Record {
+  // Byte sequence representing the record value.
+  Rope value;
+
+  // ID of the source of the record, typically an index of the given file
+  // pattern list. This field is used to determine where the record comes from,
+  // and is useful to specify the source when reading from multiple input
+  // sources.
+  int source_id;
+};
 
 // An interface to iterate sequentially a set of record (Rope).
 class RecordIterator {
@@ -44,12 +67,57 @@ class RecordIterator {
   // fills in 'key' and 'value'.
   virtual bool Next(string* key, Rope* value) = 0;
 
+  // Resets this iterator, if possible. Sub-classes should return true on a
+  // successful reset. If 'randomize_location' is true, then the iterator is
+  // moved to point to a random record (if supported).
+  virtual bool ResetIterator(bool randomize_location) {
+    return false;
+  }
+
   // Register a method to create a RecordIterator for the 'type_name'.
   typedef std::function<RecordIterator*(const string&)> FactoryMethod;
   static bool Register(const string& type_name, FactoryMethod method);
 
+  struct ParserOptions {
+    thread::ThreadPool* executor = nullptr;
+    int64_t epoch = 0;
+    int num_input_replicas = 1;
+    int input_replica_id = 0;
+
+    // max_records_per_shard and min_shards should be considered as
+    // recommendations from the RecordYielder. They are not hard limits and
+    // can be ignored by PatternParserMethod.
+
+    // Each shard should ideally contain no more than this number of records.
+    int max_records_per_shard = 0;
+    // Desired minimum number of shards.
+    int min_shards = 1;
+  };
+  // As above, but also register a custom method for parsing file_pattern
+  // strings into lists of shards.
+  typedef std::function<Status(const string&, const ParserOptions&,
+                               std::vector<std::string>*)>
+      PatternParserMethod;
+  static bool RegisterWithPatternParser(const string& type_name,
+                                        FactoryMethod method,
+                                        PatternParserMethod parser_method);
+
   // Returns a record iterator for 'filename' of 'type_name'.
   static RecordIterator* New(const string& type_name, const string& filename);
+
+  // Returns the prefix in a file pattern, or an empty string if not exist.
+  // Example: "tfrecord:data_dir/data.tfrecord" => "tfrecord"
+  static string GetFilePatternPrefix(const string& file_pattern);
+
+  // Similar to the function above, but in addition to returning the prefix also
+  // modifies the file_pattern by stripping away the prefix portion.
+  static string StripPrefixFromFilePattern(string* file_pattern);
+
+  // Parse a file pattern into a list of matching files.
+  static Status ParsePattern(const string& type_name,
+                             const string& file_pattern_list,
+                             const ParserOptions& options,
+                             std::vector<string>* filenames);
 };
 
 // RecordYielder defines an interface that should be used for producing value
@@ -66,10 +134,10 @@ class RecordIterator {
 //   opts.bufsize = 1000000;    // A randomized buffer with 1M records.
 //   opts.parallelism = 8;      // Use 8 iterators to iterate through all files.
 //   RecordYielder* yielder = BasicRecordYielder::New(opts);
-//   Rope val;
+//   Record record;
 //   while (true) {
-//     yielder->Yield(&val);
-//     // process val
+//     yielder->Yield(&record);
+//     // process record.
 //   }
 //   yielder->Close();
 //
@@ -78,8 +146,12 @@ class RecordYielder {
  public:
   virtual ~RecordYielder();
 
-  // Yields one 'value'.
-  virtual Status Yield(Rope* value) = 0;
+  // Yields one Record.
+  // To read from multiple input sources and keep track of the source id, create
+  // a WeightedMixRecordYielder and create a BasicRecordYielder for each
+  // source. Each BasicRecordYielder can assign some fields in 'record' to
+  // indicate some characteristics of the data source.
+  virtual Status Yield(Record* record) = 0;
 
   // Stop this yielder and then delete it.
   virtual void Close() = 0;
@@ -106,13 +178,46 @@ class BasicRecordYielder : public RecordYielder {
     string file_pattern;
 
     // Random seed. It determines how data files are shuffled.
-    int64 seed = 0;
+    int64_t seed = 0;
 
     // Randomization buffer keeps these many records.
-    int64 bufsize = 1;
+    int64_t bufsize = 1;
+
+    // If non-zero, attempt to keep this many seconds of records in the
+    // randomization buffer. The buffer size will never exceed bufsize.
+    int64_t bufsize_in_seconds = 0;
 
     // Uses this many concurrent iterators to iterate through files.
     int32 parallelism = 1;
+
+    // Source id to be supplied with yield.
+    int32 source_id = 0;
+
+    int num_input_replicas = 1;
+    int input_replica_id = 0;
+
+    // Make Options loggable, using https://abseil.io/tips/215.
+    template <typename Sink>
+    friend void AbslStringify(Sink& sink, const Options& opts) {
+      std::string result;
+
+      absl::StrAppendFormat(&result, "{\n");
+      absl::StrAppendFormat(&result, "  file_pattern: \"%s\"\n",
+                            opts.file_pattern);
+      absl::StrAppendFormat(&result, "  seed: %d\n", opts.seed);
+      absl::StrAppendFormat(&result, "  bufsize: %d\n", opts.bufsize);
+      absl::StrAppendFormat(&result, "  bufsize_in_seconds: %d\n",
+                            opts.bufsize_in_seconds);
+      absl::StrAppendFormat(&result, "  parallelism: %d\n", opts.parallelism);
+      absl::StrAppendFormat(&result, "  source_id: %d\n", opts.source_id);
+      absl::StrAppendFormat(&result, "  num_input_replicas: %d\n",
+                            opts.num_input_replicas);
+      absl::StrAppendFormat(&result, "  input_replica_id: %d\n",
+                            opts.input_replica_id);
+      absl::StrAppendFormat(&result, "}");
+
+      sink.Append(result);
+    }
   };
 
   // Returns a record yielder according to 'opts'. A caller is responsible for
@@ -120,17 +225,29 @@ class BasicRecordYielder : public RecordYielder {
   // delete the yielder.
   static BasicRecordYielder* New(Options opts);
 
-  // Yields one 'value'.
-  Status Yield(Rope* value) override;
+  // Yields one 'record' from which the value was read.
+  Status Yield(Record* record) override;
 
   // Stop this yielder and then delete it.
   void Close() override;
 
-  // Returns the current epoch number.
-  int64 current_epoch() const { return epoch_; }
+  // Returns the current epoch number. Epoch number starts from 1 and reflects
+  // the epoch number of the record returned by the next Yield() call.
+  virtual int64_t current_epoch() const {
+    // TODO(tilarids): Use ReaderMutexLock here.
+    absl::MutexLock l(&mu_);
+    return epoch_;
+  }
+
+  // Returns the current buffer size.
+  int64_t bufsize() const {
+    absl::MutexLock l(&mu_);
+    return bufsize_;
+  }
 
  protected:
   explicit BasicRecordYielder(const Options& opts);
+  explicit BasicRecordYielder();  // USED ONLY FOR TESTS.
 
   ~BasicRecordYielder() override;
 
@@ -139,11 +256,10 @@ class BasicRecordYielder : public RecordYielder {
   struct Shard {
     int index;                      // Shard index.
     std::vector<string> filenames;  // File names given to this shard.
-    Notification done;              // Notified when this shard is done.
+    absl::Notification done;        // Notified when this shard is done.
     Status status;                  // Shard status.
   };
   void ShardLoop(Shard* shard);
-  Status MatchFiles(const string& patterns, std::vector<string>* filenames);
 
   // Returns true iff 's' indicates the yielder should stop.
   bool ShouldFinish(const Status& s);
@@ -160,50 +276,56 @@ class BasicRecordYielder : public RecordYielder {
   // Background threads. Owned.
   thread::ThreadPool* thread_;
 
-  // Epoch number.
-  std::atomic<int64> epoch_;
+  mutable absl::Mutex mu_;
 
-  Mutex mu_;
+  // Epoch number.
+  int64_t epoch_ ABSL_GUARDED_BY(mu_);
 
   // Turned to true when the yielder is deleted.
-  bool stop_ GUARDED_BY(mu_) = false;
-  Status status_ GUARDED_BY(mu_);
+  bool stop_ ABSL_GUARDED_BY(mu_) = false;
+  Status status_ ABSL_GUARDED_BY(mu_);
 
   // PRG used for randomization.
-  std::mt19937_64 rnd_ GUARDED_BY(mu_);
+  std::mt19937_64 rnd_ ABSL_GUARDED_BY(mu_);
 
   // Randomization buffer.
-  std::vector<Rope> buf_ GUARDED_BY(mu_);
+  std::vector<Rope> buf_ ABSL_GUARDED_BY(mu_);
 
   // True iff we are draining an epoch.
-  bool epoch_end_ = false;
+  bool epoch_end_ ABSL_GUARDED_BY(mu_) = false;
 
-  int64 num_records_yielded_in_epoch_ = 0;
+  int64_t num_records_yielded_in_epoch_ = 0;
+
+  // Dynamically adjusted buffer size.
+  double bufsize_ ABSL_GUARDED_BY(mu_);
+
+  // Number of Yield calls in the current adjustment interval.
+  int64_t yields_ ABSL_GUARDED_BY(mu_);
 
   // Trigger when the main loop has exited.
-  Notification main_loop_done_;
+  absl::Notification main_loop_done_;
 
   // Conditions.
-  Condition buf_empty_;
-  bool BufEmpty() const SHARED_LOCKS_REQUIRED(mu_) {
+  absl::Condition buf_empty_;
+  bool BufEmpty() const ABSL_SHARED_LOCKS_REQUIRED(mu_) {
     return stop_ || buf_.empty();
   }
 
-  Condition buf_not_full_;
-  bool BufNotFull() const SHARED_LOCKS_REQUIRED(mu_) {
-    return stop_ || static_cast<int64>(buf_.size()) < opts_.bufsize;
+  absl::Condition buf_not_full_;
+  bool BufNotFull() const ABSL_SHARED_LOCKS_REQUIRED(mu_) {
+    return stop_ || static_cast<int64_t>(buf_.size()) < bufsize_;
   }
 
-  Condition buf_enough_;
-  bool BufEnough() const SHARED_LOCKS_REQUIRED(mu_) {
+  absl::Condition buf_enough_;
+  bool BufEnough() const ABSL_SHARED_LOCKS_REQUIRED(mu_) {
     // NOTE: Unless we are finishing an epoch, we want to make sure
     // the buf_ contains enough randomized elements before yielding any.
     return stop_ || !status_.ok() || (epoch_end_ && !buf_.empty()) ||
-           (!epoch_end_ && static_cast<int64>(buf_.size()) >=
-                               std::max<int64>(1, opts_.bufsize / 2));
+           (!epoch_end_ && static_cast<int64_t>(buf_.size()) >=
+                               std::max<int64_t>(1, bufsize_ / 2));
   }
 
-  void ExtractValue(Rope* value) EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+  void ExtractValue(Rope* value) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
     if (opts_.seed == 0) {
       // Randomize at the consumer side as well.
       const auto index = rnd_() % buf_.size();
@@ -219,12 +341,15 @@ class BasicRecordYielder : public RecordYielder {
 
   void Start();
   void MainLoop();
+  void AdjustBufferSizeLoop();
 
   // For performance debugging.
-  void WaitForBufEnough() EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void WaitForBufEnough() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   TF_DISALLOW_COPY_AND_ASSIGN(BasicRecordYielder);
 };
+
+std::string Stringify(const BasicRecordYielder::Options& opts);
 
 }  // namespace lingvo
 }  // namespace tensorflow

@@ -1,8 +1,8 @@
-package(
-    default_visibility = ["//visibility:public"],
-)
+# Placeholder: load py_library
 
-licenses(["notice"])  # Apache 2.0
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
 
 py_library(
     name = "mnist",
@@ -10,6 +10,7 @@ py_library(
     deps = [
         "//lingvo:model_registry",
         "//lingvo/core:base_model_params",
+        "//lingvo/core:program_lib",
         "//lingvo/tasks/image:classifier",
         "//lingvo/tasks/image:input_generator",
     ],
@@ -17,7 +18,8 @@ py_library(
 
 py_library(
     name = "params",
-    srcs = ["__init__.py"],
+    srcs = ["params.py"],
+    tags = ["keep_dep"],
     deps = [
         ":mnist",
     ],

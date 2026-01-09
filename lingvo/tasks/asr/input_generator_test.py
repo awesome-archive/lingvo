@@ -13,18 +13,11 @@
 # limitations under the License.
 """Tests for asr.input_generator."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
-
-import numpy as np
-from six.moves import range
-
-import tensorflow as tf
-
+import lingvo.compat as tf
+from lingvo.core import test_utils
 from lingvo.tasks.asr import input_generator
+import numpy as np
 
 
 def _MakeBytesFeature(unicode_array):
@@ -57,20 +50,12 @@ def _MakeTfExample(uttid, frames, text):
   return tf.train.Example(features=tf.train.Features(feature=feature))
 
 
-def _LookupNested(nm, nested_key):
-  key_array = nested_key.split('.')
-  val = nm
-  for k in key_array:
-    val = val[k]
-  return val
-
-
-class InputTest(tf.test.TestCase):
+class InputTest(test_utils.TestCase):
 
   def _GenerateExamples(self, output_filepath):
-    example_def = [('utt1', (1234, 'HELLO WORLD')),
-                   ('utt2', (568, 'TIRED WITH ALL THESE')),
-                   ('utt3', (778, 'WOULD THAT IT WERE SO EASY'))]
+    example_def = [(b'utt1', (1234, b'HELLO WORLD')),
+                   (b'utt2', (568, b'TIRED WITH ALL THESE')),
+                   (b'utt3', (778, b'WOULD THAT IT WERE SO EASY'))]
     self._example_def = dict(example_def)
     tf_examples = []
     for xdef in example_def:
@@ -80,7 +65,7 @@ class InputTest(tf.test.TestCase):
       for ex in tf_examples:
         outf.write(ex.SerializeToString())
 
-  def _GenerateSetup(self, append_eos_frame):
+  def _GenerateSetup(self, append_eos_frame, pad_to_max_seq_length=False):
     tfrecords_filepath = os.path.join(tf.test.get_temp_dir(),
                                       'simple.tfrecords')
     self._GenerateExamples(tfrecords_filepath)
@@ -91,6 +76,7 @@ class InputTest(tf.test.TestCase):
     p.bucket_upper_bound = [2560]
     p.bucket_batch_limit = [3]
     p.append_eos_frame = append_eos_frame
+    p.pad_to_max_seq_length = pad_to_max_seq_length
     return p
 
   def _AssertAllOnes(self, np_data):
@@ -102,16 +88,16 @@ class InputTest(tf.test.TestCase):
   def _AssertShapesAsExpected(self, shapes, expected):
     for key, expected_shape in sorted(expected.items()):
       self.assertAllEqual(
-          _LookupNested(shapes, key), expected_shape, msg='Shape of %s' % key)
+          shapes.GetItem(key), expected_shape, msg='Shape of %s' % key)
 
   def _TestAsrInput(self, params):
     p = params
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False):
       inp = input_generator.AsrInput(p)
       batch = inp.GetPreprocessedInputBatch()
-      vals = sess.run(batch)
+      vals = self.evaluate(batch)
       shapes = vals.Transform(lambda x: x.shape)
-      tf.logging.info('Shapes: %s', shapes.DebugString())
+      shapes.VLog(0, 'shapes: ')
       # sample_ids      (3, 1)
       # src.src_inputs  (3, 1235, 40, 1)
       # src.paddings    (3, 1235)
@@ -120,9 +106,14 @@ class InputTest(tf.test.TestCase):
       # tgt.paddings    (3, 30)
       # tgt.weights     (3, 30)
       batch_size = p.bucket_batch_limit[0]
-      max_num_frames = np.amax([xdef[0] for xdef in self._example_def.values()])
-      if p.append_eos_frame:
-        max_num_frames += 1
+      if p.pad_to_max_seq_length:
+        max_num_frames = p.source_max_length
+      else:
+        max_num_frames = np.amax(
+            [xdef[0] for xdef in self._example_def.values()])
+        if p.append_eos_frame:
+          max_num_frames += 1
+
       tgt_shape = [batch_size, p.target_max_length]
       self._AssertShapesAsExpected(
           shapes, {
@@ -175,6 +166,10 @@ class InputTest(tf.test.TestCase):
     p = self._GenerateSetup(append_eos_frame=False)
     self._TestAsrInput(p)
 
+  def testAsrInputWithStaticShape(self):
+    p = self._GenerateSetup(append_eos_frame=False, pad_to_max_seq_length=True)
+    self._TestAsrInput(p)
+
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()

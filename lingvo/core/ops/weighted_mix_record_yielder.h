@@ -40,10 +40,10 @@ namespace lingvo {
 //   // Use records from yielder1 for 70% of the yields.
 //   WeightedMixRecordYielder* yielder = WeightedMixRecordYielder::New(
 //       opts1.seed, {yielder1, yielder2}, {0.7, 0.3});
-//   Rope val;
+//   Record record;
 //   while (true) {
-//     yielder->Yield(&val);
-//     // process val.
+//     yielder->Yield(&record);
+//     // process record.
 //   }
 //   yielder->Close();
 //
@@ -52,7 +52,7 @@ class WeightedMixRecordYielder : public RecordYielder {
  public:
   ~WeightedMixRecordYielder() override;
   void Close() override;
-  Status Yield(Rope* value) override;
+  Status Yield(Record* record) override;
 
   // Creates new WeightedMixRecordYielder and takes ownership over yielders
   // provided. Those yielders should be properly initialized already and will be
@@ -60,22 +60,19 @@ class WeightedMixRecordYielder : public RecordYielder {
   // closing the WeightedMixRecordYielder returned by this function. Caller
   // should not delete the yielder as it will be handled internally.
   static WeightedMixRecordYielder* New(
-      const int64 seed,
-      const std::vector<RecordYielder*>& yielders,
+      const int64_t seed, const std::vector<RecordYielder*>& yielders,
       const std::vector<float>& input_source_weights);
 
  protected:
-  WeightedMixRecordYielder(
-      const int64 seed,
-      const std::vector<RecordYielder*>& yielders,
-      const std::vector<float>& input_source_weights);
-
+  WeightedMixRecordYielder(const int64_t seed,
+                           const std::vector<RecordYielder*>& yielders,
+                           const std::vector<float>& input_source_weights);
 
  private:
-  mutable Mutex mu_;
+  mutable absl::Mutex mu_;
 
   // PRG used for randomization.
-  std::mt19937_64 rnd_ GUARDED_BY(mu_);
+  std::mt19937_64 rnd_ ABSL_GUARDED_BY(mu_);
 
   std::discrete_distribution<size_t> sample_distribution_;
 

@@ -14,19 +14,14 @@
 # ==============================================================================
 """Early stopping based on dev-set performance."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import hyperparams
-from lingvo.core.ops import py_x_ops
+from lingvo.core import ops
+from lingvo.core import py_utils
 
 
-class MetricHistory(object):
+class MetricHistory:
   """Record given metric versus global_step history to a file."""
 
   @staticmethod
@@ -124,11 +119,11 @@ class MetricHistory(object):
     fname = self._hist_file
     if not self.params.local_filesystem:
       fname += '%r=3.2:sl=8M'
-    with tf.gfile.FastGFile(fname, 'a') as f:
+    with tf.io.gfile.GFile(fname, 'a') as f:
       f.write('%d %f\n' % (global_step, value))
 
 
-class EarlyStop(object):
+class EarlyStop:
   """Early stopping based on dev-set performance.
 
   Factors out the steps needed to perform early stopping in the trainer when a
@@ -138,7 +133,7 @@ class EarlyStop(object):
 
   @classmethod
   def Params(cls):
-    p = hyperparams.Params()
+    p = hyperparams.InstantiableParams(cls)
     p.Define('name', 'EarlyStop', '')
     p.Define('metric_history', MetricHistory.Params(), 'Metric history params.')
     p.Define(
@@ -146,17 +141,32 @@ class EarlyStop(object):
         'useful if progress is asymptotic.')
     p.Define('window', 0, 'Maximum number of steps between best and current.')
     p.Define('verbose', True, 'Log early-stop checks.')
+    p.Define('min_steps', 0, 'Minimum number of steps before stopping.')
+    p.Define(
+        'logging_interval', 100,
+        'The number of global steps after which the early stop metric '
+        'history is updated.')
     return p
 
   def __init__(self, params):
     self.params = params.Copy()
-    if self.params.window:
-      self._metric_history = MetricHistory(self.params.metric_history)
-    else:
-      self._metric_history = None
-    self._node = None
     self._best_step = 0
     self._last_step = 0
+
+    if self.params.window:
+      self._metric_history = MetricHistory(self.params.metric_history)
+
+      @tf.function
+      def BestStep():
+        return ops.best_step(self.metric_history.hist_file,
+                             self.params.tolerance,
+                             self.metric_history.minimize,
+                             self.metric_history.metric)
+
+      self._node = BestStep
+    else:
+      self._metric_history = None
+      self._node = None
 
   @property
   def metric_history(self):
@@ -170,37 +180,20 @@ class EarlyStop(object):
   def last_step(self):
     return self._last_step
 
-  def FProp(self, theta):
-    """Creates an op to determine the best step from the metric history file.
-
-    Args:
-      theta: Not currently used.
-    Returns:
-      The created op.
-
-    This uses BestStepOp rather than reading the file directly from python in
-    order to ensure compatibility with DevBasedSchedule for learning-rate decay.
-    It is natural to use dev-based decay and early stopping together, for
-    example decaying when dev-set perplexity hasn't improved for n steps, and
-    stopping when it hasn't improved for 3n steps.
-    """
-    del theta  # not used
-    if self.params.window:
-      self._node = py_x_ops.best_step(
-          self.metric_history.hist_file, self.params.tolerance,
-          self.metric_history.minimize, self.metric_history.metric)
-    else:
-      self._node = None
-    return self._node
-
-  def Stop(self, session):
+  def Stop(self, session=None):
     """Returns true if stop criterion is met."""
-    if self.params.window and self._node is not None:
-      self._best_step, self._last_step = session.run(self._node)
-      s = self._last_step - self._best_step > self.params.window
+    if self._node is not None:
+      if py_utils.IsEagerMode():
+        self._best_step, self._last_step = self._node()
+      else:
+        self._best_step, self._last_step = session.run(self._node())
+      s = (
+          self._last_step - self._best_step > self.params.window and
+          self._last_step >= self.params.min_steps)
       if self.params.verbose:
-        tf.logging.info('early stop check: best_step=%d, last_step=%d, stop=%d',
-                        self._best_step, self._last_step, s)
+        tf.logging.info(
+            'early stop check: best_step=%d, last_step=%d, stop=%d',
+            self._best_step, self._last_step, s)
       return s
     else:
       return False

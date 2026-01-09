@@ -1,17 +1,18 @@
 """Implements custom rules for Lingvo."""
 
-load("@bazel_tools//tools/build_defs/pkg:pkg.bzl", "pkg_tar")
-load("@subpar//:subpar.bzl", "par_binary")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 def tf_copts():
-    # TODO(drpng): autoconf this.
-    return ["-D_GLIBCXX_USE_CXX11_ABI=0", "-Wno-sign-compare"] + select({
+    #  "-Wno-sign-compare", "-mavx" removed for compat with aarch64
+    return ["-std=c++17"] + select({
         "//lingvo:cuda": ["-DGOOGLE_CUDA=1"],
         "//conditions:default": [],
     })
 
-def lingvo_cc_library(name, srcs = [], hdrs = [], deps = []):
-    native.cc_library(
+def lingvo_cc_library(name, srcs = [], hdrs = [], deps = [], testonly = 0):
+    cc_library(
         name = name,
         copts = tf_copts(),
         srcs = srcs,
@@ -19,10 +20,20 @@ def lingvo_cc_library(name, srcs = [], hdrs = [], deps = []):
         deps = [
             "@tensorflow_includes//:includes",
         ] + deps,
+        testonly = testonly,
+    )
+
+def lingvo_cc_test_library(name, srcs = [], hdrs = [], deps = []):
+    lingvo_cc_library(
+        name = name,
+        srcs = srcs,
+        hdrs = hdrs,
+        deps = deps + ["@com_google_googletest//:gtest"],
+        testonly = 1,
     )
 
 def lingvo_cc_binary(name, srcs = [], deps = []):
-    native.cc_binary(
+    cc_binary(
         name = name,
         copts = tf_copts(),
         srcs = srcs,
@@ -32,26 +43,25 @@ def lingvo_cc_binary(name, srcs = [], deps = []):
         ] + deps,
     )
 
-def lingvo_cc_test(name, srcs, deps = []):
-    native.cc_test(
+def lingvo_cc_test(name, srcs, deps = [], **kwargs):
+    cc_test(
         name = name,
         copts = tf_copts(),
         srcs = srcs,
         deps = [
             "@tensorflow_includes//:includes",
             "@tensorflow_solib//:framework_lib",
+            "@com_google_benchmark//:benchmark",
             "@com_google_googletest//:gtest_main",
         ] + deps,
+        **kwargs
     )
 
-def lingvo_py_binary(*args, **kwargs):
-    # Extract all files to a temporary directory is required to allow access to
-    # the shared object containing lingvo ops.
-    kwargs["zip_safe"] = False
-    par_binary(*args, **kwargs)
+# TODO(b/263806511): Determine if this alias breaks any existing OSS use-cases.
+lingvo_py_binary = native.py_binary
 
 def custom_kernel_library(name, op_def_lib, srcs, hdrs = [], deps = []):
-    native.cc_library(
+    cc_library(
         name = name,
         srcs = srcs,
         hdrs = hdrs,
@@ -62,32 +72,35 @@ def custom_kernel_library(name, op_def_lib, srcs, hdrs = [], deps = []):
         alwayslink = 1,
     )
 
-def gen_op_cclib(name, srcs, deps):
+def gen_op_cclib(name, srcs, deps = [], nonportable_deps = []):
     # TODO(drpng): gpu.
-    native.cc_library(
+    cc_library(
         name = name,
         srcs = srcs,
         deps = [
             "@tensorflow_includes//:includes",
             "@tensorflow_solib//:framework_lib",
-        ] + deps,
+        ] + deps + nonportable_deps,
         alwayslink = 1,
         copts = tf_copts(),
     )
 
-def gen_op_pylib(name, cc_lib_name, srcs, kernel_deps):
-    native.cc_binary(
+def gen_op_pylib(name, cc_lib_name, srcs, kernel_deps, py_deps = [], **kwargs):
+    cc_binary(
         name = cc_lib_name + ".so",
         deps = [cc_lib_name] + kernel_deps,
         linkshared = 1,
         copts = tf_copts(),
+        **kwargs
     )
 
     native.py_library(
         name = name,
         srcs = srcs,
-        srcs_version = "PY2AND3",
+        srcs_version = "PY3",
         data = [cc_lib_name + ".so"],
+        deps = py_deps,
+        **kwargs
     )
 
 def lingvo_cuda_py_test(name, tags = [], deps = [], **kwargs):
@@ -144,6 +157,10 @@ def lingvo_proto_cc(name, src, deps = []):
         srcs = [basename + ".pb.cc"],
         hdrs = [basename + ".pb.h"],
     )
+    lingvo_cc_library(
+        name = "%s_cc" % name,
+        deps = [":%s" % name],
+    )
 
 def lingvo_proto_py(name, src, deps = []):
     # TODO(drpng): only works with proto with no deps within lingvo.
@@ -153,4 +170,27 @@ def lingvo_proto_py(name, src, deps = []):
     native.py_library(
         name = name,
         srcs = [basename + "_pb2.py"],
+    )
+
+# Placeholders to use until bazel supports pytype_{,strict_}{library,test,binary}.
+def pytype_library(name, **kwargs):
+    native.py_library(name = name, **kwargs)
+
+def pytype_strict_library(name, **kwargs):
+    native.py_library(name = name, **kwargs)
+
+def pytype_strict_binary(name, **kwargs):
+    native.py_binary(name = name, **kwargs)
+
+def py_strict_test(name, **kwargs):
+    native.py_test(name = name, **kwargs)
+
+def pytype_strict_test(name, **kwargs):
+    native.py_test(name = name, **kwargs)
+
+def lingvo_portable_pytype_library(name, deps = [], nonportable_deps = [], **kwargs):
+    pytype_library(
+        name = name,
+        deps = deps + nonportable_deps,
+        **kwargs
     )

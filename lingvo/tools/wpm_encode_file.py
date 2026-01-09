@@ -14,15 +14,11 @@
 # ==============================================================================
 """Encode file using the wpm_encoder."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import numpy as np
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import wpm_encoder
+import numpy as np
+import six
+from six import text_type
 
 tf.flags.DEFINE_string(
     'source_filepaths', '',
@@ -87,11 +83,9 @@ def _MakeTfExample(enc, src_i, src_s, tgt_i, tgt_s):
 
 
 def _Preprocess(text):
-  if not isinstance(text, unicode):
-    text = text.decode('utf-8')
-  text = text.strip()
-  text = text.replace(' </s>', '')
-  return text
+  if not isinstance(text, text_type):
+    text = six.ensure_text(text, 'utf-8')
+  return text.strip().replace(' </s>', '')
 
 
 def _RunEncoding():
@@ -101,13 +95,13 @@ def _RunEncoding():
   src_encode_op = enc.Encode(src_txt_placeholder)
   tgt_txt_placeholder = tf.placeholder(tf.string, [])
   tgt_encode_op = enc.Encode(tgt_txt_placeholder)
-  pairs = zip(
-      FLAGS.source_filepaths.split(','), FLAGS.target_filepaths.split(','))
+  pairs = list(
+      zip(FLAGS.source_filepaths.split(','), FLAGS.target_filepaths.split(',')))
   with tf.python_io.TFRecordWriter(FLAGS.output_filepath) as outf:
     n = 0
     for p in pairs:
-      with tf.gfile.Open(p[0], 'r') as sourcef:
-        with tf.gfile.Open(p[1], 'r') as targetf:
+      with tf.io.gfile.GFile(p[0], 'r') as sourcef:
+        with tf.io.gfile.GFile(p[1], 'r') as targetf:
           for textp in zip(sourcef.readlines(), targetf.readlines()):
             n += 1
             if n % 10000 == 0:

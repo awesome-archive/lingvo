@@ -13,12 +13,7 @@
 # limitations under the License.
 """Utilities for fusing language models with the decoder output."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import layers
 from lingvo.core import py_utils
@@ -30,7 +25,7 @@ class FusionBase(base_layer.BaseLayer):
 
   @classmethod
   def Params(cls):
-    p = super(FusionBase, cls).Params()
+    p = super().Params()
     p.Define('lm', lm_layers.NullLm.Params(), 'Language model params.')
     p.Define(
         'base_model_logits_dim', None,
@@ -38,7 +33,6 @@ class FusionBase(base_layer.BaseLayer):
         'logits.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
     """Initializes Fusion class."""
     try:
@@ -47,16 +41,22 @@ class FusionBase(base_layer.BaseLayer):
     except AttributeError:
       pass
 
-    super(FusionBase, self).__init__(params)
+    super().__init__(params)
 
     p = self.params
     self.CreateChild('lm', p.lm)
 
-  def zero_state(self, batch_size):
+  def _child_variable_scope_override(self):
+    return {**super()._child_variable_scope_override(), 'lm': []}
+
+  def zero_state(self, theta, batch_size):
     """Returns initial model state for fusion model."""
     state0 = py_utils.NestedMap()
-    state0.lm_states = self.lm.zero_state(batch_size)
+    state0.lm_states = self.lm.zero_state(theta.lm, batch_size)
     return state0
+
+  def _FPropLmInternal(self, theta, ids, paddings, lm_states, misc=None):
+    return self.lm.FProp(theta, ids, paddings, lm_states)
 
   def _FPropLm(self, theta, state0, ids, paddings, misc=None):
     """LM FProp.
@@ -68,13 +68,13 @@ class FusionBase(base_layer.BaseLayer):
         children.
       state0: A NestedMap of states (specific to the layer).
       ids: Target ids, of shape [batch_size] for single step unrolling or
-        [batch_size, base_model_logits_dim] for the entire sequence.
+        [seq_len, batch_size] for the entire sequence.
       paddings: Target paddings, of the same shape as 'ids'.
       misc: NestedMap of miscellaneous items, which might be needed during
         training.
 
     Returns:
-      (lm_output, state1), with:
+      (lm_output, state1):
 
       - lm_output: A NestedMap containing lm output. If 'ids' is 1-D, then
         lm_output should have shape [batch_size, dim]; if it is 2-D then the
@@ -82,7 +82,10 @@ class FusionBase(base_layer.BaseLayer):
       - state1: A NestedMap of updated states.
     """
     state1 = state0.DeepCopy()
-    is_single_step = (ids.shape.ndims == 1)
+    if isinstance(ids.shape, tf.TensorShape):
+      is_single_step = (ids.shape.rank == 1)
+    else:
+      is_single_step = len(ids.shape) == 1
     if is_single_step:
       seq_len = 1
     else:
@@ -90,9 +93,11 @@ class FusionBase(base_layer.BaseLayer):
 
     self._ModifyLmBeforeFProp(theta, state0, ids, paddings, misc)
 
-    lm_output, state1.lm_states = self.lm.FProp(
-        theta.lm, tf.reshape(ids, [seq_len, -1]),
-        tf.reshape(paddings, [seq_len, -1]), state0.lm_states)
+    with tf.name_scope('lm'):
+      ids = tf.reshape(ids, [seq_len, -1], name='reshape_ids')
+      paddings = tf.reshape(paddings, [seq_len, -1], name='reshape_paddings')
+      lm_output, state1.lm_states = self._FPropLmInternal(
+          theta.lm, ids, paddings, state0.lm_states, misc)
 
     if is_single_step:
       # lm outputs have dimension [time, batch, dim]. Since this is only one
@@ -114,13 +119,13 @@ class FusionBase(base_layer.BaseLayer):
         [batch_size, base_model_logits_dim] for a single step unrolling or
         [seq_len, batch_size, base_model_logits_dim] for the entire sequence.
       ids: Target ids, of shape [batch_size] for single step unrolling or
-        [batch_size, base_model_logits_dim] for the entire sequence.
+        [seq_len, batch_size] for the entire sequence.
       paddings: Target paddings, of the same shape as 'ids'.
       misc: NestedMap of miscellaneous items, which might be needed during
         training.
 
     Returns:
-      (fused_output, state1), with:
+      (fused_output, state1):
 
       - fused_output: A tensor containing the fused result. If am_output is 2-D,
         then the fused_output should have shape [batch_size, dim]; if

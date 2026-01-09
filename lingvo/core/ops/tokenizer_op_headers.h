@@ -46,7 +46,7 @@ class LabelToTokenIdOp : public OpKernel {
                 errors::InvalidArgument("labels must be a vector, but get ",
                                         labels.shape().DebugString()));
     const int batch = labels.NumElements();
-    auto Tlabels = labels.flat<string>();
+    auto Tlabels = labels.flat<tstring>();
     Tensor token_ids(DT_INT32, TensorShape({batch, maxlen_}));
     auto Ttoken_ids = token_ids.matrix<int32>();
     Ttoken_ids.setZero();  // Sanity
@@ -61,7 +61,8 @@ class LabelToTokenIdOp : public OpKernel {
       VLOG(1) << i << " " << Tlabels(i);
       std::vector<int32> ids = TokenizerClass::StringToIds(Tlabels(i));
       if (ids.size() + 1 > maxlen_) {
-        LOG(WARNING) << "Too long target " << ids.size() << " " << Tlabels(i);
+        LOG(WARNING) << "Truncating target sequence (" << ids.size()
+                     << ") to maximum allowed length (" << maxlen_ << ")";
         ids.resize(maxlen_ - 1);
       }
       const int id_size = ids.size();
@@ -131,7 +132,7 @@ class IdToTokenOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({batch}), &out));
     const auto& t_ids = ids.matrix<int32>();
     const auto& t_seq_lens = seq_lens.vec<int32>();
-    auto t_out = out->template vec<string>();
+    auto t_out = out->template vec<tstring>();
     for (int i = 0; i < batch; ++i) {
       const int len_i = std::max(0, t_seq_lens(i));
       std::vector<int32> ids_i(len_i);

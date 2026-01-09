@@ -14,15 +14,11 @@
 # ==============================================================================
 """Tests for retry."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
 from lingvo.core import retry
+from lingvo.core import test_utils
 
 
-class RetryTest(tf.test.TestCase):
+class RetryTest(test_utils.TestCase):
 
   def testRetry(self):
 
@@ -89,4 +85,4 @@ class RetryTest(tf.test.TestCase):
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()

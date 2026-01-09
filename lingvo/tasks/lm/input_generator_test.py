@@ -14,18 +14,12 @@
 # ==============================================================================
 """Tests for lm.input_generator."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import os
-import tensorflow as tf
-
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.tasks.lm import input_generator
 
 
-class InputGeneratorTest(tf.test.TestCase):
+class InputGeneratorTest(test_utils.TestCase):
 
   def _InputParams(self):
     p = input_generator.LmInput.Params()
@@ -42,21 +36,21 @@ class InputGeneratorTest(tf.test.TestCase):
   def testLmInputGen(self):
     p = self._InputParams()
 
-    with self.session(use_gpu=False) as sess:
-      inp = p.cls(p)
-      inp_batch = sess.run(inp.InputBatch())
+    with self.session(use_gpu=False):
+      inp = p.Instantiate()
+      inp_batch = self.evaluate(inp.GetPreprocessedInputBatch())
       print(inp_batch)
-      # pyformat: disable
-      # pylint: disable=line-too-long
       expected_ids = [
-          [1, 13, 24, 3, 23, 5, 13, 8, 3, 24, 12, 5, 24, 3, 24, 27, 19, 3, 19, 10],
-          [1, 24, 12, 9, 3, 17, 5, 14, 19, 22, 13, 24, 29, 3, 27, 13, 16, 16, 3, 6],
+          [1, 8, 19, 18, 3, 32, 24, 3, 35, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          [
+              1, 27, 12, 29, 3, 8, 19, 9, 23, 3, 9, 26, 9, 22, 29, 24, 12, 13,
+              18, 11
+          ],
       ]
-      # pylint: enable=line-too-long
-      # pyformat: enable
       self.assertEqual(expected_ids, inp_batch.ids.tolist())
-      self.assertEqual([[1.0] * 20, [1.0] * 20], inp_batch.weights.tolist())
+      self.assertEqual([[1.0] * 9 + [0.0] * 11, [1.0] * 20],
+                       inp_batch.weights.tolist())
 
 
 if __name__ == "__main__":
-  tf.test.main()
+  test_utils.main()

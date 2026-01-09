@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,16 +23,10 @@ Speech and Signal Processing, 2012
 
 https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/37842.pdf
 """
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import sys
-
-import tensorflow as tf
-
-from lingvo.core.ops import py_x_ops
+import lingvo.compat as tf
+from lingvo.core import ops
+from lingvo.core import py_utils
+import six
 
 # Must be a large ID.
 NO_TOKEN = 1 << 31 - 1
@@ -45,7 +38,8 @@ SENTENCE_END_STRING = '</s>'
 BOW_STR = '▁'
 
 
-class WpmEncoder(object):
+class WpmEncoder:
+  """WPM encoder."""
 
   def __init__(self, wpm_filepath, merge_prob=1.):
     """Create a WPM encoder.
@@ -55,21 +49,23 @@ class WpmEncoder(object):
       merge_prob: the probability of merging tokens while encoding.
     """
     # Load vocabulary file.
+    lines = py_utils.ReadFileLines(wpm_filepath)
+
     self._pieces = []
-    with tf.gfile.Open(wpm_filepath, 'r') as f:
-      for line in f.readlines():
-        line = line.decode('utf-8')
-        piece = line.strip().split('\t')[0]
-        self._pieces.append(piece)
+    for line in lines:
+      if isinstance(line, bytes):
+        line = six.ensure_text(line, 'utf-8')
+      piece = line.strip().split('\t')[0]
+      self._pieces.append(piece)
     self._merge_prob = merge_prob
 
   def _TokenToString(self, token):
-    return py_x_ops.vocab_id_to_token(token, vocab=self._pieces)
+    return ops.vocab_id_to_token(token, vocab=self._pieces)
 
   def _StringToToken(self, tokstr):
     return tf.where(
-        py_x_ops.token_in_vocab(tokstr, vocab=self._pieces),
-        py_x_ops.vocab_token_to_id(tokstr, vocab=self._pieces),
+        ops.token_in_vocab(tokstr, vocab=self._pieces),
+        ops.vocab_token_to_id(tokstr, vocab=self._pieces),
         tf.broadcast_to(NO_TOKEN, tf.shape(tokstr)))
 
   def _MergeTokens(self, tokens):
@@ -97,7 +93,7 @@ class WpmEncoder(object):
 
     def _ShouldMerge(unused_tokens, candidates):
       """Merge until not possible, or we abort early according to merge_prob."""
-      return tf.logical_and(
+      return tf.math.logical_and(
           tf.reduce_any(tf.not_equal(candidates, NO_TOKEN)),
           tf.random.uniform([]) < self._merge_prob)
 
@@ -147,8 +143,8 @@ class WpmEncoder(object):
     Encoding includes prefixing the beginning-of-word token to each word.
 
     Returns:
-      ids: the encoded integer ids.
-      tokens: the encoded string.
+      (ids, tokens) where ids is the encoded integer ids and tokens is the
+      encoded string.
     """
     words = tf.sparse.to_dense(tf.strings.split([text]), default_value='')[0]
     num_words = tf.size(words)

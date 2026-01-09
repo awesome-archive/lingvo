@@ -14,32 +14,55 @@
 # ==============================================================================
 """Tests for base_model_params."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
 from lingvo.core import base_model_params
+from lingvo.core import test_utils
 
 
-class BaseModelParamsTest(tf.test.TestCase):
+class TestModelParams(base_model_params.SingleTaskModelParams):
+
+  def GetAllDatasetParams(self):
+    raise NotImplementedError('test error')
+
+
+class PartialDatasetParams(base_model_params.SingleTaskModelParams):
+
+  def GetAllDatasetParams(self):
+    return dict(Test_X1=self.Test())
+
+  def Test_X2(self):
+    pass
+
+
+class BaseModelParamsTest(test_utils.TestCase):
 
   def testGetDatasetParams_SingleTaskModelParams(self):
-    dummy_model = base_model_params.SingleTaskModelParams
+    dummy_model = base_model_params.SingleTaskModelParams()
     self.assertEqual(dummy_model.Train(), dummy_model.GetDatasetParams('Train'))
     self.assertEqual(dummy_model.Dev(), dummy_model.GetDatasetParams('Dev'))
     self.assertEqual(dummy_model.Test(), dummy_model.GetDatasetParams('Test'))
-    with self.assertRaises(AttributeError):
+    with self.assertRaises(base_model_params.DatasetError):
       dummy_model.GetDatasetParams('Invalid')
 
   def testGetDatasetParams_MultiTaskModelParams(self):
-    dummy_model = base_model_params.MultiTaskModelParams
+    dummy_model = base_model_params.MultiTaskModelParams()
     self.assertEqual(dummy_model.Train(), dummy_model.GetDatasetParams('Train'))
     self.assertEqual(dummy_model.Dev(), dummy_model.GetDatasetParams('Dev'))
     self.assertEqual(dummy_model.Test(), dummy_model.GetDatasetParams('Test'))
-    with self.assertRaises(AttributeError):
+    with self.assertRaises(base_model_params.DatasetError):
       dummy_model.GetDatasetParams('Invalid')
+
+  def testGetDatasetParams_NotImplementedError(self):
+    dummy_model = TestModelParams()
+    with self.assertRaisesRegex(NotImplementedError, 'test error'):
+      dummy_model.GetDatasetParams('Train')
+
+  def testGetDatasetParams_PartialDatasetParams(self):
+    dummy_model = PartialDatasetParams()
+    self.assertEqual(dummy_model.Test(),
+                     dummy_model.GetDatasetParams('Test_X1'))
+    with self.assertRaises(base_model_params.DatasetError):
+      dummy_model.GetDatasetParams('Test_X2')
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()

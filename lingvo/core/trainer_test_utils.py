@@ -14,16 +14,17 @@
 # ==============================================================================
 """Toy models and input generation tools for testing trainer code."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
-
+from lingvo import model_registry
+import lingvo.compat as tf
 from lingvo.core import base_input_generator
-from lingvo.core import base_layer
 from lingvo.core import base_model
+from lingvo.core import base_model_params
+from lingvo.core import metrics as metrics_lib
+from lingvo.core import program
 from lingvo.core import py_utils
+from lingvo.core import summary_utils
+
+import numpy as np
 
 
 class CountingInputGenerator(base_input_generator.BaseInputGenerator):
@@ -45,20 +46,20 @@ class CountingInputGenerator(base_input_generator.BaseInputGenerator):
 
   @classmethod
   def Params(cls):
-    p = super(CountingInputGenerator, cls).Params()
+    p = super().Params()
     p.Delete('batch_size')
     p.Define('batch_size', 2, 'batch size')
     p.Define('shape', [2, 2], 'source shape.')
     return p
 
   def __init__(self, params):
-    super(CountingInputGenerator, self).__init__(params)
+    super().__init__(params)
     self.shape = params.shape
 
-  def InputBatch(self):
+  def _InputBatch(self):
     length = tf.reduce_prod(self.shape)
-    counter = base_model.StatsCounter('CountingInputGenerator')
-    new_value = tf.cast(counter.IncBy(None, length), dtype=tf.int32) - length
+    counter = summary_utils.StatsCounter('CountingInputGenerator')
+    new_value = tf.cast(counter.IncBy(length), dtype=tf.int32) - length
     new_value = tf.stop_gradient(new_value)
     values = new_value + tf.range(length)
     shaped_values = tf.reshape(tf.cast(values, dtype=tf.float32), self.shape)
@@ -69,25 +70,36 @@ class CountingInputGenerator(base_input_generator.BaseInputGenerator):
 class IdentityRegressionTask(base_model.BaseTask):
   """A simple regression task for testing."""
 
-  @base_layer.initializer
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.Define('weight_init_value', 0.8, 'Initial value of the model weights.')
+    p.name = 'identity_regression_task'
+    return p
+
   def __init__(self, params):
-    super(IdentityRegressionTask, self).__init__(params)
-    with tf.variable_scope('IdentityRegressionTask'):
-      self.CreateVariable(
-          'm',
-          py_utils.WeightParams(shape=[], init=py_utils.WeightInit.Uniform()))
-      self.CreateVariable(
-          'b',
-          py_utils.WeightParams(shape=[], init=py_utils.WeightInit.Uniform()))
+    super().__init__(params)
     self.global_steps = []
     self.metrics = []
     self.result_per_example_tensors = []
+
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
+    p = self.params
+    self.CreateVariable(
+        'm',
+        py_utils.WeightParams(
+            shape=[], init=py_utils.WeightInit.Constant(p.weight_init_value)))
+    self.CreateVariable(
+        'b',
+        py_utils.WeightParams(
+            shape=[], init=py_utils.WeightInit.Constant(p.weight_init_value)))
 
   def ComputePredictions(self, theta, input_batch):
     """sum(m * x) + b."""
     return tf.reduce_sum(theta.m * input_batch.src_ids, axis=1) + theta.b
 
-  def ComputeLoss(self, theta, input_batch, predicted):
+  def ComputeLoss(self, theta, predicted, input_batch):
     diff = predicted - input_batch.tgt_ids
     per_example_loss = diff * diff
     batch_dim = py_utils.GetShape(per_example_loss)[0]
@@ -115,27 +127,95 @@ class IdentityRegressionTask(base_model.BaseTask):
     self.metrics.append(metrics)
     self.result_per_example_tensors.append(per_example_tensors)
 
+  def CreateDecoderMetrics(self):
+    return {
+        'num_samples_in_batch': metrics_lib.AverageMetric(),
+        'diff': metrics_lib.AverageMetric(),
+    }
 
-class IdentityRegressionModel(base_model.SingleTaskModel):
-  """Simple regression model for testing."""
+  def DecodeWithTheta(self, theta, input_batch):
+    diff = self.ComputePredictions(theta, input_batch) - input_batch.tgt_ids
+    return {'diff': diff}
 
-  @base_layer.initializer
-  def __init__(self, params):
-    super(IdentityRegressionModel, self).__init__(params)
+  def PostProcessDecodeOut(self, dec_out_dict, dec_metrics_dict):
+    diff = dec_out_dict['diff']
+    dec_metrics_dict['diff'].Update(np.mean(diff))
+    dec_metrics_dict['num_samples_in_batch'].Update(len(diff))
+    return []
+
+
+class ModelTrackingFPropResults(base_model.SingleTaskModel):
+  """Simple regression model."""
+
+  def __init__(self, params, **kwargs):
+    super().__init__(params, **kwargs)
     self.global_steps = []
     self.metrics = []
     self.result_per_example_tensors = []
-
-  @classmethod
-  def Params(cls):
-    p = super(IdentityRegressionModel, cls).Params()
-    p.name = 'IdentityRegressionModel'
-    p.input = CountingInputGenerator.Params()
-    p.task = IdentityRegressionTask.Params()
-    return p
 
   def ProcessFPropResults(self, sess, global_step, metrics,
                           per_example_tensors):
     self.global_steps.append(global_step)
     self.metrics.append(metrics)
     self.result_per_example_tensors.append(per_example_tensors)
+
+
+def RegisterIdentityRegressionModel(  # pylint: disable=invalid-name
+    batch_size=2,
+    weight_init_value=0.8,
+    optimizer=None,
+    learning_rate=1.0,
+    max_train_steps=10,
+    train_steps_per_loop=2,
+    eval_decode_steps_per_loop=2,
+    eval_decode_samples_per_summary=10):
+  """Register an IdentityRegressionTask model with given configuration.
+
+  Args:
+    batch_size: batch size of CountingInputGenerator.
+    weight_init_value: constant init value for the model varialbes.
+    optimizer: if set, the optimizer params to use.
+    learning_rate: the learning rate to use.
+    max_train_steps: maximum training steps.
+    train_steps_per_loop: number of training steps per TPU loop.
+    eval_decode_steps_per_loop: number of evaluation/decode steps per TPU loop.
+    eval_decode_samples_per_summary: number of samples to eval/decode for each
+      checkpoint.
+  """
+
+  class IdentityRegressionModel(base_model_params.SingleTaskModelParams):
+    """Model params for IdentityRegressionTask."""
+
+    def Train(self):
+      return CountingInputGenerator.Params().Set(batch_size=batch_size)
+
+    def Test(self):
+      return CountingInputGenerator.Params().Set(batch_size=batch_size)
+
+    def Task(self):
+      p = IdentityRegressionTask.Params().Set(
+          weight_init_value=weight_init_value)
+      if optimizer:
+        p.train.optimizer = optimizer
+      p.train.learning_rate = learning_rate
+      p.train.max_steps = max_train_steps
+      p.train.tpu_steps_per_loop = train_steps_per_loop
+      p.eval.samples_per_summary = eval_decode_samples_per_summary
+      p.eval.decoder_samples_per_summary = eval_decode_samples_per_summary
+      return p
+
+    def Model(self):
+      return ModelTrackingFPropResults.Params(self.Task())
+
+    def ProgramSchedule(self):
+      p = program.SimpleProgramScheduleForTask(
+          train_dataset_name='Train',
+          train_steps_per_loop=train_steps_per_loop,
+          eval_dataset_names=['Test'],
+          eval_steps_per_loop=eval_decode_steps_per_loop,
+          decode_steps_per_loop=eval_decode_steps_per_loop)
+      if max_train_steps == 0:
+        p.train_executions_per_eval = 0
+      return p
+
+  model_registry.RegisterSingleTaskModel(IdentityRegressionModel)

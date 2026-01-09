@@ -1,35 +1,22 @@
-package(
-    default_visibility = ["//visibility:public"],
-)
+# Placeholder: load py_library
 
-licenses(["notice"])  # Apache 2.0
+package(default_visibility = ["//visibility:public"])
 
-filegroup(
-    name = "param_files",
-    srcs = glob(
-        include = [
-            "*.py",
-        ],
-    ),
-)
+licenses(["notice"])
 
 py_library(
     name = "params",
     srcs = [
-        ":param_files",
+        "params.py",
+        "wmt14_en_de.py",
+        "wmtm16_en_de.py",
+        "xendec/wmt14_en_de.py",
     ],
+    tags = ["keep_dep"],
     deps = [
         "//lingvo:model_registry",
-        "//lingvo/core:attention",
         "//lingvo/core:base_model_params",
-        "//lingvo/core:layers",
-        "//lingvo/core:lr_schedule",
-        "//lingvo/core:optimizer",
-        "//lingvo/core:py_utils",
-        "//lingvo/core:rnn_cell",
-        "//lingvo/core:rnn_layers",
-        "//lingvo/tasks/mt:decoder",
-        "//lingvo/tasks/mt:encoder",
+        "//lingvo/tasks/mt:base_config",
         "//lingvo/tasks/mt:input_generator",
         "//lingvo/tasks/mt:model",
     ],

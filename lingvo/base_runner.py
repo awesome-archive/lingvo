@@ -14,128 +14,347 @@
 # ==============================================================================
 """Base class for all jobs."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+import contextlib
 import os
-import pickle
 import time
 import traceback
-import tensorflow as tf
 
-from tensorflow.core.framework import summary_pb2
-from tensorflow.core.protobuf import saver_pb2
-
+from typing import Optional
 from lingvo import base_trial
+from lingvo import pdb_wrapper
+from lingvo import trainer_utils  # pylint: disable=unused-import
+import lingvo.compat as tf
+from lingvo.core import checkpointer
 from lingvo.core import cluster_factory
 from lingvo.core import early_stop
 from lingvo.core import py_utils
 
-tf.flags.DEFINE_integer(
-    'enqueue_max_steps', -1, 'Max enqueue steps. -1 meaning no limit.'
-    ' This flag should be set for unit-test only.')
 
-tf.flags.DEFINE_integer('saver_max_to_keep', 100,
-                        'Maximum number of recent checkpoints to keep.')
+tf.flags.DEFINE_bool('disable_tf2_summary', True,
+                     'If True, disables TF2 summary writing.')
 
 FLAGS = tf.flags.FLAGS
 
 
-class BaseRunner(object):
+class BaseRunner:
   """Base class for all jobs."""
 
-  def __init__(self,
-               params,
-               model_task_name,
-               logdir,
-               tf_master,
-               trial=base_trial.NoOpTrial()):
-    """Construct a new BaseRunner.
+  def __init__(
+      self,
+      params,
+      model_task_name='',
+      logdir='',
+      tf_master='',
+      trial=base_trial.NoOpTrial(),
+      create_global_step=True,
+  ):
+    """A job runner.
 
     Args:
-      params:  Params object containing model configuration.
-      model_task_name:  String name of the task this runner should execute
-        for multitask models only.  See flag for details.
-      logdir:  String path to the log directory to output to.
-      tf_master:  String path to the master job, e.g. 'local'.
-      trial:   An optional hyperparameter trial. Used by Vizier studies.
+      params: Params object containing model configuration.
+      model_task_name: String name of the task this runner should execute for
+        multitask models only.  See flag for details.
+      logdir: String path to the log directory to output to.
+      tf_master: String path to the master job, e.g. 'local'.
+      trial: An optional hyperparameter trial. Used by Vizier studies.
+      create_global_step: Whether to create the global step variable.
     """
-    p = params.Copy()
+    self._params = trial.OverrideModelParams(params.Copy())
+    p = self.params
 
-    self._params = trial.OverrideModelParams(p)
+    self._model_task_name = model_task_name
+    self._logdir = logdir
+    self._train_dir = os.path.join(self._logdir, 'train')
+
+    self._tf_master = tf_master
+    self._trial = trial
+
+    # If the runner is conducting a Vizier trial, scope all the variables
+    # (e.g., global_step) by the trial id so that we do not share states across
+    # trials.
+    self._container_id = self._trial.Name()
+    # Maybe check params after trial param over-write and private classes set.
+    self._MaybeCheckParamsDuringInitAfterTrialOverride()
+    tf.io.gfile.makedirs(self._train_dir)
+
+    # Set in subclasses.
+    self._job_name = ''
+    self._daemon = False
+    self._verbose_enqueue_logging = False
+
+    self._checkpointer: checkpointer.Checkpointer = None
+    self._should_report_metrics = False
+
+    self._graph = None if py_utils.IsEagerMode() else tf.Graph()
+    self._summary_writer: tf.summary.SummaryWriter = None
+    self._initialize_tables = None
+    self._dequeue_thread_complete = False
+
+    self._early_stop = None
+    # The actual EarlyStop object.
+    if p.train.early_stop and p.train.early_stop.window:
+      early_stop.MetricHistory.SetLogdirInMetricHistories(p, self._logdir)
+      self._early_stop = p.train.early_stop.Instantiate()
+      self._verbose_enqueue_logging = True
+
+    # Merged TF scalar summaries for training related input data stats.
+    self._merged_input_data_summary_op = None
+
+    # To early terminate a runner, we set max_steps here and that will trigger
+    # appropriate ShouldStop behavior in the threads. This is used by Vizier
+    # to early stop a trial and also EarlyStop to stop training based on
+    # metrics.
+    self._max_steps_for_early_stop = None
+
+    self.enqueue_ops = None
+
     tf.logging.info('=' * 60)
     for line in self.params.ToText().split('\n'):
       tf.logging.info('%s', line)
     tf.logging.info('=' * 60)
 
-    self._logdir = logdir
-    self._tf_master = tf_master
-    self._model_task_name = model_task_name
-    self._trial = trial
-    # If the runner is conducting a Vizier trial, scope all the variables
-    # (e.g., global_step) by the trial id so that we do not share states across
-    # trials.
-    self._container_id = self._trial.Name()
-    self._should_report_metrics = False
-
-    # To early terminate a runner, we set max_steps here and that will trigger
-    # appropriate ShouldStop behavior in the threads. This is used by Vizier
-    # to early stop a trial.
-    self._max_steps = None
-
-    self._cluster = cluster_factory.Cluster(self.params.cluster)
-    self._train_dir = os.path.join(self._logdir, 'train')
-    self._graph = tf.Graph()
-    self._summary_writer = None
-    self.initialize_tables = None
-
-    early_stop.MetricHistory.SetLogdirInMetricHistories(p, logdir)
-    self._early_stop = None
-    if p.train.early_stop and p.train.early_stop.window:
-      self._early_stop = early_stop.EarlyStop(p.train.early_stop)
-      with self._graph.as_default():
-        self._early_stop.FProp(None)
-
     self._SetStatusMessage('Starting ...')
+    self.params.cluster.logdir = logdir
+    self._cluster = cluster_factory.Cluster(self.params.cluster)
+    self._worker_cluster_def = self._cluster.worker_cluster_def
+
+    if py_utils.IsEagerMode():
+      self._cluster.InitDevicesEager()
+    else:
+      self._cluster.InitDevices(self._GetSession())
+
+    # Ensure global step tensor is created.
+    if create_global_step:
+      with contextlib.ExitStack() as stack:
+        if not py_utils.IsEagerMode():
+          assert self._graph  # Tell pytype that this Optional isn't None
+          stack.enter_context(self._graph.as_default())
+          stack.enter_context(tf.device(self._cluster.GetPlacer()))
+        # It is important that we enter the tf.container scope *after*
+        # the graph scope. If we reverse the ordering, the tf.container
+        # basically has no-effect which is a tricky silent error.
+        stack.enter_context(tf.container(self._container_id))
+        self._global_step_var = py_utils.GetOrCreateGlobalStepVar()
+    else:
+      self._global_step_var = None
 
   @property
   def params(self):
     return self._params
 
-  def _InVizierStudy(self):
-    return not isinstance(self._trial, base_trial.NoOpTrial)
+  def Start(self):
+    pass
+
+  def _CreateCheckpointer(self, train_dir, model):
+    """Wrapper method for override purposes."""
+    if py_utils.IsEagerMode():
+      if FLAGS.use_eager_v2_checkpoints:
+        return checkpointer.EagerCheckpointerV2(
+            train_dir, model, check_loading_status=False)
+      return checkpointer.EagerCheckpointerV1(train_dir, model)
+    return checkpointer.Checkpointer(train_dir, model)
+
+  @classmethod
+  def _GetTtlDir(cls, path, duration):
+    """Returns a path to a time-limited directory under dir if required."""
+    del duration
+    return path
+
+  def _FormatStatusMessage(self, message, retrying):
+    if self._trial and self._trial.Name():
+      message = 'Trial:{} {}'.format(self._trial.Name(), message)
+    if retrying:
+      message = f'Job {self._job_name}: <b>Retrying as expected</b>\n{message}'
+    return message
 
   def _SetStatusMessage(self, message, retrying=False):
     """Update the status message for this task."""
-    if self._trial.Name():
-      message = 'Trial:{} {}'.format(self._trial.Name(), message)
-    if retrying:
-      message = '<b>Retrying as expected</b> ' + str(message)
-    tf.logging.info(message)
-    return message
+    tf.logging.info(self._FormatStatusMessage(message, retrying))
 
-  def _ShouldStop(self, sess, step):
-    """Check if the runner should stop."""
+  def _ExportMetrics(self, **kwargs):
+    """Exports metrics externally."""
+    pass
+
+  def _ShouldEarlyStop(self, sess: Optional[tf.Session] = None) -> bool:
+    return self._early_stop and self._early_stop.Stop(sess)  # pytype: disable=bad-return-type
+
+  def _ShouldStop(self, sess=None, step=None, check_early_stop=True) -> bool:
+    """Check if the runner should stop.
+
+    Args:
+      sess: tf.Session.
+      step: The current GlobalStep.
+      check_early_stop: Whether or not we want to check the EarlyStop condition.
+        In TPU-training, we don't want to check this at the every step
+        granularity in the enqueue thread, as this may starve the TPU training
+        loop which by default operates at the 1000 steps granularity.
+
+    Returns:
+      Whether runner should stop.
+    """
+    if step is None:
+      if py_utils.IsEagerMode():
+        step = py_utils.GetGlobalStep().numpy()
+      else:
+        step = sess.run(py_utils.GetGlobalStep())
+
     if step >= self.params.train.max_steps:
       tf.logging.info('ShouldStop: step:%6d params.train.max_steps:%6d', step,
                       self.params.train.max_steps)
       return True
 
-    if self._max_steps and step >= self._max_steps:
-      tf.logging.info('ShouldStop: step:%6d _max_steps:%6d', step,
-                      self._max_steps)
+    if (self._max_steps_for_early_stop and
+        step >= self._max_steps_for_early_stop):
+      tf.logging.info('ShouldStop: step:%6d _max_steps_for_early_stop:%6d',
+                      step, self._max_steps_for_early_stop)
       return True
 
-    if self._early_stop and self._early_stop.Stop(sess):
+    if check_early_stop and self._ShouldEarlyStop(sess):
       tf.logging.info('ShouldStop: Early stopping.')
+      return True
+
+    if self._trial and self._trial.ShouldStop():
+      tf.logging.info('ShouldStop: Trial finished.')
       return True
 
     return False
 
+  @py_utils.Retry(
+      initial_delay_sec=1, delay_growth_factor=1.5, max_delay_sec=300)
+  def _FindNewCheckpoint(self, sess=None, processed_ckpts=None):
+    """Returns the path to a new checkpoint, or raises RuntimeError."""
+    if self._ShouldStop(sess, step=0):
+      # Check for early stopping or trail early stopping.
+      return None
+    path = tf.train.latest_checkpoint(self._checkpointer.checkpoint_dir)
+    if not path:
+      raise RuntimeError('No check point is found in %s' %
+                         self._checkpointer.checkpoint_dir)
+    if path in processed_ckpts:
+      raise RuntimeError('No new check point is found: %s' % path)
+    return path
+
+  def _TrainerFinished(self, sess=None) -> bool:
+    """Infer if training finished using the latest training checkpoint."""
+    latest_ckpt_path = tf.train.latest_checkpoint(
+        self._checkpointer.checkpoint_dir)
+    if latest_ckpt_path is None:
+      return self._ShouldStop(sess, step=0)
+
+    # Load the checkpoint and pull out the global step variable.
+    latest_ckpt = tf.train.load_checkpoint(latest_ckpt_path)
+    if not py_utils.IsEagerMode():
+      return self._ShouldStop(sess, step=latest_ckpt.get_tensor('global_step'))
+    # The reason to run the following heuristic is that in Eager mode it'll have
+    # a name like 'variables/0/_global_step_var/.ATTRIBUTES/VARIABLE_VALUE'.
+    for key in latest_ckpt.get_variable_to_shape_map():
+      if 'global_step' in key:
+        global_step = latest_ckpt.get_tensor(key)
+        tf.logging.info('Found global_step variable in checkpoint (%d)',
+                        global_step)
+        return self._ShouldStop(sess, step=global_step)
+    tf.logging.info('Failed to find global_step variable in checkpoint')
+    return self._ShouldStop(sess, step=0)
+
+  def _RunOnLatestCheckpoints(self, sess=None, runner_fn=None, runner_dir=None):
+    """Executes 'runner_fn' on the latest checkpoints produced by the Trainer.
+
+    Args:
+      sess: the session to compute the metrics in.
+      runner_fn: a callable taking a session and a checkpoint path to apply to
+        checkpoints saved by the Trainer.
+      runner_dir: the log directory for this runner.
+    """
+    # Check if the trainer finished before this job (re)started. global_step
+    # will be 0 in this process until a checkpoint is restored, so we infer the
+    # trainer global_step from the step of its latest checkpoint.
+    trainer_finished_at_job_start = self._TrainerFinished(sess)
+    processed_ckpts = set(py_utils.GetProcessedCheckpoints(runner_dir))
+    if (trainer_finished_at_job_start and tf.train.latest_checkpoint(
+        self._checkpointer.checkpoint_dir) in processed_ckpts):
+      tf.logging.warning(
+          'Training has finished and the final checkpoint has already been '
+          'evaluated. Specify a new eval/decode directory, or set '
+          'p.eval.load_checkpoint_from to the final checkpoint to reanalyze it.'
+      )
+      return
+
+    # Process the latest checkpoints produced by the Trainer until the
+    # checkpoint for the final training step has been processed. If training
+    # has already finished then only the last checkpoint will be processed.
+    while True:
+      ckpt_path = self._FindNewCheckpoint(sess, processed_ckpts)
+      if ckpt_path is None:
+        # Could potentially be None in the case of early stopping.
+        break
+
+      runner_fn(sess, ckpt_path)
+      py_utils.UpdateProcessedCheckpoints(runner_dir, ckpt_path)
+      processed_ckpts.add(ckpt_path)
+      if self._ShouldStop(sess):
+        break
+
+  def _RunOnAllCheckpoints(self, sess=None, runner_fn=None, runner_dir=None):
+    """Executes 'runner_fn' on all checkpoints produced by the Trainer.
+
+    Args:
+      sess: the session to compute the metrics in.
+      runner_fn: a callable taking a session and a checkpoint path to apply to
+        checkpoints saved by the Trainer.
+      runner_dir: the log directory for this runner.
+    """
+    # Check if the trainer finished before this job (re)started. global_step
+    # will be 0 in this process until a checkpoint is restored, so we infer the
+    # trainer global_step from the step of its latest checkpoint.
+    trainer_finished_at_job_start = self._TrainerFinished(sess)
+    processed_ckpts = set(py_utils.GetProcessedCheckpoints(runner_dir))
+
+    while True:
+      # Checkpoints may be deleted while runner_fn is running, so we fetch the
+      # checkpoint state every loop.
+      state = tf.train.get_checkpoint_state(self._checkpointer.checkpoint_dir)
+      ckpts = set() if state is None else state.all_model_checkpoint_paths
+      unprocessed_ckpts = set(ckpts).difference(processed_ckpts)
+
+      if unprocessed_ckpts:
+        # Process the checkpoints sequentially.
+        ckpt_path = checkpointer.SortCheckpointPaths(unprocessed_ckpts)[0]
+        try:
+          runner_fn(sess, ckpt_path)
+          py_utils.UpdateProcessedCheckpoints(runner_dir, ckpt_path)
+          processed_ckpts.add(ckpt_path)
+        except tf.errors.NotFoundError as e:
+          # Though it should be exceedingly rare in realistic cases, it's
+          # technically possible for the checkpoint in ckpt_path to be deleted
+          # by Trainer.checkpointer during the set and sort operations above.
+          tf.logging.warning(
+              'Ignorring NotFoundError resulting from rare race '
+              'condition:\n%s', e)
+      elif trainer_finished_at_job_start or self._ShouldStop(sess):
+        # Exit if all checkpoints have been processed and training is done.
+        break
+      else:
+        # Check for new checkpoints every 10 seconds if none are found. Spends
+        # 1s worth of CPU cycles every ~3hrs looking for new checkpoints.
+        time.sleep(10)
+
+  def _InVizierStudy(self):
+    return not isinstance(self._trial, base_trial.NoOpTrial)
+
+  def _UpdateEarlyStopMetric(self, jobname, global_step, metric_name,
+                             metric_value):
+    if not self._early_stop:
+      return
+
+    if (self._early_stop.params.logging_interval and
+        global_step % self._early_stop.params.logging_interval == 0):
+      early_stop.MetricHistory.ConditionalAppend(
+          os.path.join(self._logdir, jobname), metric_name, global_step,
+          metric_value)
+
   def _WriteToLog(self, text, logdir, filename):
     """Logs `text` and saves it under `logdir/filename`."""
-    with tf.gfile.FastGFile(os.path.join(logdir, filename), 'w') as f:
+    with tf.io.gfile.GFile(os.path.join(logdir, filename), 'w') as f:
       f.write(text)
 
     if self._summary_writer is not None:
@@ -147,124 +366,182 @@ class BaseRunner(object):
                   tag=filename, tensor=tf.make_tensor_proto([text]))
           ]))
 
-  def _GetSaver(self):
-    """Returns a saver."""
-    assert tf.get_default_graph() == self._graph
-    if self.params.is_eval and self._model.ema:
-      tf.logging.info('Using EMA for evaluation.')
-      return tf.train.Saver(self._model.ema.variables_to_restore())
-    return tf.train.Saver(
-        sharded=True,
-        max_to_keep=FLAGS.saver_max_to_keep,
-        keep_checkpoint_every_n_hours=0.5,  # one per 30 minutes
-        pad_step_number=True,  # %08d
-        write_version=saver_pb2.SaverDef.V2)
+  def _WaitUntilInit(self, sess=None, start_up_delay_steps=None):
+    """Wait until the model is ready."""
+    # Wait a fix amount of time at start.
+    time.sleep(30)
 
-  def _LoadCheckpointForEval(self, sess, checkpoint_path):
-    """Load the checkpoint for evaluation."""
-    tf.logging.info('Load from checkpoint %s.', checkpoint_path)
-    self._saver.restore(sess, checkpoint_path)
-    tf.logging.info('Load checkpoint done.')
+    @py_utils.Retry(retry_value=(tf.errors.FailedPreconditionError,))
+    def RetryLoop():
+      try:
+        if py_utils.IsEagerMode():
+          global_step = py_utils.GetGlobalStep().numpy
+        else:
+          global_step = sess.run(py_utils.GetGlobalStep())
+      except tf.errors.FailedPreconditionError as e:
+        tf.logging.info('%s: Probably the expected race on global_step: %s',
+                        self._job_name, e)
+        raise
+      msg = 'step:%6d' % global_step
+      self._SetStatusMessage(msg)
+      if start_up_delay_steps:
+        if global_step < start_up_delay_steps:
+          msg = 'global step (%d) has not reached start up delay steps (%d)' % (
+              global_step, self._start_up_delay_steps)
+          tf.logging.info('%s: %s', self._job_name, msg)
+          raise tf.errors.FailedPreconditionError(
+              node_def=None, op=None, message=msg)
+      return global_step
 
-  @py_utils.Retry(initial_delay_sec=300, max_delay_sec=300)
-  def _FindNewCheckpoint(self, prev_path, sess):
-    """Returns the path to a new checkpoint, or raises RuntimeError."""
-    if self._trial.ShouldStop() or self._ShouldStop(sess, 0):
-      return None
-    path = tf.train.latest_checkpoint(self._train_dir)
-    if not path:
-      msg = 'No check point is found in %s' % self._train_dir
-      tf.logging.info('%s', msg)
-      raise RuntimeError(msg)
-    if path == prev_path:
-      msg = 'No new check point is found: %s' % path
-      tf.logging.info('%s', msg)
-      raise RuntimeError(msg)
-    return path
+    return RetryLoop()
 
-  @py_utils.Retry()
-  def _RunLoop(self, job_name, loop_func, loop_args=()):
+  @py_utils.Retry(max_retries=20)
+  def _RunLoop(self, job_name, loop_func, loop_args=(), cleanup_func=None):
     """Runs `loop_func`, retrying on expected errors.
 
     Args:
       job_name: string job name.
       loop_func: callable to run and retry on expected errors.
       loop_args: list or tuple of arguments to be passed to the loop_func.
+      cleanup_func: callable to run before retry.
     """
     try:
       tf.logging.info('%s started.', job_name)
       loop_func(*loop_args)
       tf.logging.info('%s done.', job_name)
+
+      if self._daemon:
+        # In daemon mode, an external scheduler will retry the job on 0 status.
+        # So exit with a non-zero status to prevent retry.
+        self._SetStatusMessage(
+            '%s completed successfully. Exiting with FAILURE to prevent retry.'
+            % job_name)
+        time.sleep(300)  # Wait a bit for other threads to complete.
+        os._exit(4)  # pylint: disable=protected-access
+
       return
-    except py_utils.transient_tf_errors + (tf.errors.OutOfRangeError,
-                                           tf.errors.DataLossError) as e:
-      # Retry on these three errors.
-      #   FailedPreconditionError: variables are not initialized.
-      #   AbortedError: processes restarts.
-      #   OutOfRangeError: Test/dev datasets are exhausted.
-      #   DataLossError: Race condition between evaler and trainer when saving
-      #       or removing checkpoints.
-      self._SetStatusMessage(
-          '%s exception: %r\n' % (job_name, e), retrying=True)
+    except Exception as e:  # pylint:disable=broad-except
+      if isinstance(e, base_trial.TunerManagedError):
+        # For tuner managed error, we propagate the error to the caller.
+        raise e from None
 
-      for msg in traceback.format_exc().split('\n'):
-        tf.logging.error(msg)
+      fatal_error_msgs = [
+          'Compilation failure',
+          'Run-time shape mismatch for TPUExecute argument'
+      ]
+      if any([x in str(e) for x in fatal_error_msgs]):
+        # Fatal error if failing to compile graph on TPU.
+        retry = False
+      elif isinstance(e, tf.errors.AbortedError):
+        # AbortedError: is thrown when processes restarts.
+        retry = True
+        if self._InVizierStudy():
+          # With Vizier studies, we want to avoid retrying under some error
+          # conditions, these are captured here.
+          # Do not retry (via raise/retry) if AbortedError with RecvTensor
+          # message. This can happen if there are memory issues.
+          if ('The same RecvTensor (WorkerServiceImpl) request was received '
+              'twice' in str(e)):
+            retry = False
+            tf.logging.info('%s done (infeasible error).', job_name)
+      elif isinstance(e, tf.errors.OutOfRangeError):
+        #   OutOfRangeError: Test/dev datasets are exhausted.
+        retry = self._cluster.do_eval
+      elif isinstance(e, tf.errors.InvalidArgumentError):
+        #   InvalidArgumentError: variables were not initialized. Comes from
+        #       ResourceVariableOp.
+        retry = True
+        # Do not retry within Vizier study when NaNs cause InvalidArgumentError.
+        if self._InVizierStudy():
+          if 'Tensor had NaN values' in str(e):
+            retry = False
+            tf.logging.info('%s done (infeasible result due to NaN values).',
+                            job_name)
+      elif isinstance(
+          e, py_utils.transient_tf_errors +
+          (tf.errors.DataLossError, tf.errors.CancelledError)):
+        # Retry on these errors.
+        #   FailedPreconditionError: variables are not initialized.
+        #   DataLossError: Race condition between evaler and trainer when saving
+        #       or removing checkpoints.
+        #   CancelledError: Node was closed (on TPU).
+        retry = True
+      else:
+        retry = False
 
-      # With Vizier studies, we want to avoid retrying under some error
-      # conditions, these are captured here.
-      if self._InVizierStudy():
-        # Do not retry (via raise/retry) if AbortedError with RecvTensor
-        # message. This can happen if there are memory issues.
-        if (isinstance(e, tf.errors.AbortedError) and
-            'The same RecvTensor (WorkerServiceImpl) request was received twice'
-            in str(e)):
-          if self._should_report_metrics:
-            self._trial.ReportDone(
-                infeasible=True,
-                infeasible_reason='Infeasible error encountered.')
-          tf.logging.info('%s done (infeasible error).', job_name)
+      if FLAGS.pdb_on_exception and not retry:
+        pdb_wrapper.post_mortem()
+        retry = True
+
+      if retry:
+        # Retry indefinitely (error should be transient).
+        self._SetStatusMessage(
+            '%s exception: %s\n' % (job_name, e), retrying=True)
+
+        for msg in traceback.format_exc().split('\n'):
+          tf.logging.vlog(1, msg)
+
+        if cleanup_func:
+          cleanup_func()
+
+        if self._daemon:
+          # In daemon mode, retry will be handled by an external scheduler by
+          # returning a 0 status.
+          tf.logging.error('Execution stopped due to fatal error. '
+                           'Returning 0 to be scheduled for retry.')
+          tf.logging.flush()
+          time.sleep(10)
+          os._exit(0)  # pylint: disable=protected-access
+
+        raise
+      else:
+        # Allow the job to complete on errors that are unlikely to be transient,
+        # e.g. caused by a mis-configured model.
+        if self._should_report_metrics:
+          self._trial.ReportDone(
+              infeasible=True,
+              infeasible_reason='Fatal error encountered: %s' % e)
+        tf.logging.error('%s done (fatal error): %s', job_name, e)
+
+        self._SetStatusMessage('%s exception: %s\n' % (job_name, e))
+
+        # Prints the error message line by line to avoid message cropping.
+        msgv = traceback.format_exc().split('\n')
+        for msg in msgv:
+          tf.logging.error(msg)
+
+        # Check if we are potentially running within an experiment. If so,
+        # the worker should continue to the next trial instead of terminating
+        # the process.
+        if self._InVizierStudy():
           return
 
-      # Retry indefinitely (error should be transient).
-      raise
-    except Exception as e:  # pylint: disable=broad-except
-      # Allow the job to complete on errors that are unlikely to be transient,
-      # e.g. caused by a mis-configured model.
-      if self._should_report_metrics:
-        self._trial.ReportDone(
-            infeasible=True, infeasible_reason='Fatal error encountered.')
-      tf.logging.info('%s done (fatal error).', job_name)
+        # tf.logging.fatal prints out stack traces. Typically, that's not
+        # useful at all here. Here we want to exit the program
+        # definitively. Because LOG(QFATAL) is not easily available via
+        # python so far, we need a way to exit the program directly.
+        # Because sys.exit(1) must be called from the main thread, and does
+        # not cancel non-daemon threads anyway, we use os._exit instead.
+        tf.logging.flush()
+        time.sleep(10)
+        os._exit(1)  # pylint: disable=protected-access
 
-      self._SetStatusMessage('%s exception: %s\n' % (job_name, e))
+  def _DequeueThreadComplete(self):
+    self._dequeue_thread_complete = True
+    return
 
-      # Prints the error message line by line to avoid message cropping.
-      msgv = traceback.format_exc().split('\n')
-      for msg in msgv:
-        tf.logging.error(msg)
+  def _LoopEnqueue(self, op, session_override=None):
+    """Runs the enqueue op in a loop. Used by the Trainer and TrainerTpu."""
+    if py_utils.IsEagerMode():
+      raise ValueError('_LoopEnqueue is not supported in eager mode.')
+    p = self.params
+    sess = session_override or self._GetSession()
 
-      # Check if we are potentially running within an experiment. If so,
-      # the worker should continue to the next trial instead of terminating the
-      # process.
-      if self._InVizierStudy():
-        return
-
-      # tf.logging.fatal prints out stack traces. Typically, that's not
-      # useful at all here. Here we want to exit the program
-      # definitively. Because LOG(QFATAL) is not easily available via
-      # python so far, we need a way to exit the program directly.
-      # Because sys.exit(1) must be called from the main thread, and does
-      # not cancel non-daemon threads anyway, we use os._exit instead.
-      # Because tf.logging.error() may return before the flush is complete,
-      # we need an extra sleep before exit.
-      time.sleep(15)
-      os._exit(1)  # pylint: disable=protected-access
-
-  def _LoopEnqueue(self, op):
-    """Runs the enqueue op in a loop."""
-    with tf.container(self._container_id), self._GetSession() as sess:
-      if self.initialize_tables is not None:
-        sess.run(self.initialize_tables)
-      gsteps = self._model.global_step
+    with tf.container(self._container_id), sess:
+      if self._initialize_tables is not None:
+        sess.run(self._initialize_tables)
+      for task in self._model.tasks:
+        task.input.Initialize(sess)
       local_enqueue_steps = 0
 
       # Global enqueue steps measures how many global steps have data enqueued
@@ -273,55 +550,105 @@ class BaseRunner(object):
       global_enqueue_steps = None
 
       tf.logging.info('params.train.max_steps: %d, enqueue_max_steps: %d',
-                      self.params.train.max_steps, FLAGS.enqueue_max_steps)
+                      p.train.max_steps, p.train.enqueue_max_steps)
       while True:
-        global_step, = sess.run([gsteps])
+        if self._dequeue_thread_complete:
+          tf.logging.info(
+              'LoopEnqueue done since consuming thread is done.')
+          return
+
+        global_step = sess.run(py_utils.GetGlobalStep())
         if global_enqueue_steps is None:
           global_enqueue_steps = global_step
-        if local_enqueue_steps % 1000 == 0:
+        if local_enqueue_steps % 1000 == 0 or self._verbose_enqueue_logging:
           tf.logging.info(
               'Current global_enqueue_steps: %d, '
               'local_enqueue_steps: %d, global_step: %d', global_enqueue_steps,
               local_enqueue_steps, global_step)
 
         if py_utils.use_tpu():
-          global_steps_with_available_data = int(
-              global_enqueue_steps // self.params.train.tpu_steps_per_loop *
-              self.params.train.tpu_steps_per_loop)
+          global_steps_with_available_data = int(global_enqueue_steps //
+                                                 p.train.tpu_steps_per_loop *
+                                                 p.train.tpu_steps_per_loop)
+          # In TPU Training, the training thread in TrainerTpu is responsible
+          # for checking early stop via _ShouldEarlyStop.
+          check_early_stop = False
         else:
           global_steps_with_available_data = global_enqueue_steps
+          check_early_stop = True
 
-        if (self._ShouldStop(sess, global_steps_with_available_data) or
-            self._ShouldStop(sess, global_step)):
-          tf.logging.info('Done. ShouldStop is True.')
-          return
-        if (FLAGS.enqueue_max_steps > 0 and
-            local_enqueue_steps > FLAGS.enqueue_max_steps):
-          tf.logging.info('Done. FLAGS.enqueue_max_steps reached.')
-          return
+        if (self._ShouldStop(sess, global_steps_with_available_data,
+                             check_early_stop) or
+            self._ShouldStop(sess, global_step, check_early_stop)):
+          tf.logging.info('Enqueue loop: Done. ShouldStop is True. Sleeping')
+          time.sleep(15)
+          continue
+        if (p.train.enqueue_max_steps > 0 and
+            local_enqueue_steps >= p.train.enqueue_max_steps):
+          tf.logging.info('Enqueue loop: Done. train.enqueue_max_steps '
+                          'reached. Sleeping.')
+          time.sleep(15)
+          continue
         local_enqueue_steps += 1
 
-        # There are tpu_infeed_parallism parallel threads enqueuing.
+        # There are tpu_infeed_parallelism parallel threads enqueuing.
         # We account for all of them when updating global_enqueue_steps.
-        global_enqueue_steps += self.params.input.tpu_infeed_parallism
+        global_enqueue_steps += p.input.tpu_infeed_parallelism
 
-        sess.run([op])
+        # Input data stats generated during training are collected and logged in
+        # in input generators. The merged summary op for input data stats merges
+        # all the scalar summaries for the stats logged from the input
+        # generators. If merged scalar summaries for input data stats are
+        # available write them to the training directory along with processing
+        # the TPU infeed op.
+        if self._merged_input_data_summary_op is not None:
+          summary_str, _ = sess.run([self._merged_input_data_summary_op, op])
+          self._WriteInputDataStatSummaries(summary_str, global_enqueue_steps)
+        else:
+          sess.run([op])
 
   def _GetSession(self, **kwargs):
+    if py_utils.IsEagerMode():
+      raise ValueError('_GetSession is not supported in eager mode.')
+    graph = kwargs.pop('graph', self._graph)
     return tf.Session(
-        self._tf_master,
-        graph=self._graph,
-        config=py_utils.SessionConfig(**kwargs))
+        self._tf_master, graph=graph, config=py_utils.SessionConfig(**kwargs))
 
-  @classmethod
-  def _GetTtlDir(cls, path, duration):
-    """Returns a path to a time-limited directory under dir if required."""
-    del duration
-    return path
+  def GetTrainDir(self):
+    return self._train_dir
 
   def _CreateSummaryWriter(self, logdir):
     """Creates and returns a tf summary writer."""
     return tf.summary.FileWriter(logdir)
+
+  def _CreateTF2SummaryWriter(self, logdir):
+    """Creates a tf2 summary writer."""
+    if FLAGS.disable_tf2_summary:
+      return
+    self._tf2_summary_writer = tf.compat.v2.summary.create_file_writer(logdir)
+
+  def _TF2SummaryContext(self):
+    if FLAGS.disable_tf2_summary:
+      return contextlib.ExitStack()
+    return self._tf2_summary_writer.as_default()
+
+  def _CreateTF2SummaryOps(self):
+    if FLAGS.disable_tf2_summary:
+      return
+    self._tf2_summary_op = tf.compat.v1.summary.all_v2_summary_ops()
+    self._tf2_summary_flush = self._tf2_summary_writer.flush()
+
+  def _InitializeTF2SummaryWriter(self, sess=None):
+    if FLAGS.disable_tf2_summary:
+      return
+    if not py_utils.IsEagerMode():
+      sess.run(self._tf2_summary_writer.init())
+
+  def _RunTF2SummaryOps(self, sess):
+    if FLAGS.disable_tf2_summary or py_utils.IsEagerMode():
+      return
+    sess.run(self._tf2_summary_op)
+    sess.run(self._tf2_summary_flush)
 
   def _WriteSummaries(self,
                       summary_writer,
@@ -340,34 +667,54 @@ class BaseRunner(object):
     """
     status_metrics = []
     for name, summary in sorted(summaries.items()):
-      if not isinstance(summary, summary_pb2.Summary):
+      if not isinstance(summary, tf.summary.Summary):
         tf.logging.warning(
-            'Non tf.Summary args passed to _WriteSummaries, skipping: %s @%s',
-            job_name, global_step)
+            'Non tf.Summary args passed to _WriteSummaries, skipping: '
+            'job:%s name:%s @%s', job_name, name, global_step)
         continue
       summary_writer.add_summary(summary, global_step)
-      if summary.value[0].HasField('simple_value'):
-        value = summary.value[0].simple_value
-        tf.logging.info('%s summary on checkpoint@%d %s = %.8g', job_name,
-                        global_step, name, value)
-        status_metrics.append('%s: %.8g' % (name, value))
-        early_stop.MetricHistory.ConditionalAppend(job_name, name, global_step,
-                                                   value)
-      else:
-        tf.logging.info('%s summary on checkpoint@%d %s', job_name, global_step,
-                        name)
+      if summary.value:
+        for value in summary.value:
+          if value.HasField('simple_value'):
+            tf.logging.info('%s summary on checkpoint@%d %s = %.8g', job_name,
+                            global_step, value.tag, value.simple_value)
+            status_metrics.append('%s: %.8g' % (value.tag, value.simple_value))
+            early_stop.MetricHistory.ConditionalAppend(job_name, value.tag,
+                                                       global_step,
+                                                       value.simple_value)
+          else:
+            tf.logging.info('%s summary on checkpoint@%d %s', job_name,
+                            global_step, value.tag)
     summary_writer.flush()
-    self._SetStatusMessage(
-        '%s: step:%6d, %s' % (job_name, global_step, ', '.join(status_metrics)))
+    self._SetStatusMessage('%s: step:%6d, %s' %
+                           (job_name, global_step, ', '.join(status_metrics)))
     if text_filename is not None:
-      with tf.gfile.FastGFile(text_filename, 'w') as f:
+      with tf.io.gfile.GFile(text_filename, 'w') as f:
         f.write('\n'.join(status_metrics))
 
-  def _WriteKeyValuePairs(self, filename, key_value_pairs):
-    """Writes `key_value_pairs` to `filename`."""
-    with open(filename, 'wb') as f:
-      pickle.dump(key_value_pairs, f, protocol=pickle.HIGHEST_PROTOCOL)
+  def _WriteInputDataStatSummaries(self, summary_str, global_enqueue_steps):
+    """Write input data stats as TF summaries to the training dir.
 
-  def _ExportMetrics(self, **kwargs):
-    """Exports metrics externally."""
+    Args:
+      summary_str: Merged TF scalar summaries for training related input data
+        stats.
+      global_enqueue_steps: Measures how many global steps for which data has
+        been enqueued.
+    """
+    if summary_str is None:
+      return
+
+    if global_enqueue_steps % self._input_stats_summary_interval_steps == 0:
+      self._summary_writer.add_summary(summary_str, global_enqueue_steps)
+      self._summary_writer.flush()
+
+  def _MaybeCheckParamsDuringInitAfterTrialOverride(self):
+    """This function can be over-written to do additional checks during init.
+
+    This function defaults to No Op. Children class can over-write this to
+    do additional checks on params after trial modification.
+
+    Note this function calls into __init__ after trial modification, and after
+    private members are set, before self._train_dir is created.
+    """
     pass

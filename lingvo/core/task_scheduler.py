@@ -14,15 +14,10 @@
 # ==============================================================================
 """Multi-task task sampling schedules."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import numpy as np
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import early_stop
+import numpy as np
 
 
 class TaskScheduler(base_layer.BaseLayer):
@@ -37,13 +32,12 @@ class TaskScheduler(base_layer.BaseLayer):
   @classmethod
   def Params(cls):
     """Parameters for this task scheduler."""
-    p = super(TaskScheduler, cls).Params()
+    p = super().Params()
     p.name = 'task_scheduler'
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(TaskScheduler, self).__init__(params)
+    super().__init__(params)
     self.cur_probs = None
 
   def Sample(self, current_step):
@@ -57,7 +51,7 @@ class AdaptiveScheduler(TaskScheduler):
 
   @classmethod
   def Params(cls):
-    p = super(AdaptiveScheduler, cls).Params()
+    p = super().Params()
     p.Define('tasks', [], 'List of tasks')
     p.Define('expected', [], 'List of final expected scores')
     p.Define('mh_a', early_stop.MetricHistory.Params(), '')
@@ -68,9 +62,8 @@ class AdaptiveScheduler(TaskScheduler):
     p.Define('alpha', 1.0, 'Normalized task scores are raised to this power.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(AdaptiveScheduler, self).__init__(params)
+    super().__init__(params)
     if len(self.params.tasks) != 2 or len(self.params.expected) != 2:
       raise ValueError('Only two tasks are supported by this scheduler.')
 
@@ -91,17 +84,18 @@ class AdaptiveScheduler(TaskScheduler):
     # TODO(sebjean) Time file reading and change behaviour if too long.
     for index, mh in enumerate(self._metric_histories):
       try:
-        with tf.gfile.FastGFile(mh.hist_file) as f:
+        with tf.io.gfile.GFile(mh.hist_file) as f:
           lines = f.readlines()
       except tf.errors.NotFoundError:
         tf.logging.warning('File not found. '
-                           'Expected at start of training only.')
+                                'Expected at start of training only.')
         score, lines = 0.0, []
       if lines:
         try:
           score = lines[-1].split()[-1]
         except IndexError:
-          tf.logging.warning('IndexError. Your history file may be corrupted.')
+          tf.logging.warning(
+              'IndexError. Your history file may be corrupted.')
           score = 0.0
       self.last_scores[index] = float(score)
 
@@ -183,18 +177,17 @@ class ShiftedExponentialScheduler(TaskScheduler):
 
   @classmethod
   def Params(cls):
-    p = super(ShiftedExponentialScheduler, cls).Params()
+    p = super().Params()
     p.Define(
         'alpha', 0, 'Controls the rate at which the schedule changes. '
         'A large alpha will lead to fast convergence toward final values.')
     p.Define(
         'task_probs', [], 'List of 2-tuples (task, prob). For non-constant'
-        'schedulers, prob is a tuble of the form (init_prob, final_prob).')
+        'schedulers, prob is a tuple of the form (init_prob, final_prob).')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(ShiftedExponentialScheduler, self).__init__(params)
+    super().__init__(params)
     assert isinstance(self.params.task_probs, list)
     self.tasks = []
     self._descriptors = []
@@ -225,9 +218,8 @@ class ConstantScheduler(ShiftedExponentialScheduler):
   """Constant schedule. Tasks are sampled from a fixed probability distribution.
   """
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(ConstantScheduler, self).__init__(params)
+    super().__init__(params)
 
     for key, value in self.params.task_probs:
       self.tasks.append(key)
@@ -242,9 +234,8 @@ class ExponentialScheduler(ShiftedExponentialScheduler):
   `p_1 + (p_0 - p_1) * exp(-alpha * current_step)`.
   """
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(ExponentialScheduler, self).__init__(params)
+    super().__init__(params)
 
     for key, value in self.params.task_probs:
       self.tasks.append(key)
@@ -259,9 +250,8 @@ class SigmoidScheduler(ShiftedExponentialScheduler):
   `p_1 + (2 * p_0 - p_1) * exp(-alpha * current_step)`.
   """
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(SigmoidScheduler, self).__init__(params)
+    super().__init__(params)
 
     for key, value in self.params.task_probs:
       self.tasks.append(key)
@@ -273,19 +263,106 @@ class RoundRobinScheduler(TaskScheduler):
 
   @classmethod
   def Params(cls):
-    p = super(RoundRobinScheduler, cls).Params()
+    p = super().Params()
     p.Define('tasks', [], 'List of task names. No repetitions allowed.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
-    super(RoundRobinScheduler, self).__init__(params)
+    super().__init__(params)
     assert isinstance(self.params.tasks, list)
-    self.tasks = sorted(self.params.tasks)
+    self.tasks = self.params.tasks
     self.n_tasks = len(self.tasks)
     self.cur_probs = [1. / self.n_tasks] * self.n_tasks  # For summary
+    self.next_task_idx = 0
 
   def Sample(self, current_step):
     """Sample a task."""
-    sampled_task = self.tasks[current_step % self.n_tasks]
+    sampled_task = self.tasks[self.next_task_idx]
+    self.next_task_idx = (self.next_task_idx + 1) % self.n_tasks
+    return sampled_task
+
+
+class SequentialScheduler(TaskScheduler):
+  """Deterministic schedule that stays a fixed number of steps on each task."""
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.Define(
+        'task_steps', [], 'List of tuples of (task_name, steps_for_task). Goes '
+        'through list sequentially in the specified order, staying '
+        'steps_for_task steps on task_name. On completing the schedule, '
+        'remains on the final task for the rest of the time. Assumes '
+        'p.task_global_step is False.')
+    return p
+
+  def __init__(self, params):
+    super().__init__(params)
+    assert isinstance(self.params.task_steps, list)
+    assert self.params.task_steps
+    self.task_steps = []
+    for (name, steps) in self.params.task_steps:
+      assert steps > 0
+      if self.task_steps:
+        self.task_steps.append((name, steps + self.task_steps[-1][1]))
+      else:
+        self.task_steps.append((name, steps))
+    self.n_tasks = len(self.task_steps)
+    self.task_idx = 0
+    self.cur_probs = [1] + [0] * (self.n_tasks - 1)  # For summary
+
+  def Sample(self, current_step):
+    """Sample a task."""
+    sampled_task, to_step = self.task_steps[self.task_idx]
+    if current_step >= to_step and self.task_idx < self.n_tasks - 1:
+      self.task_idx += 1
+      sampled_task = self.task_steps[self.task_idx][0]
+      self.cur_probs[self.task_idx - 1] = 0
+      self.cur_probs[self.task_idx] = 1
+    return sampled_task
+
+
+class PieceWiseScheduler(TaskScheduler):
+  """Piecewise scheduler using different scheduling strategies."""
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.Define(
+        'schedule_steps', [], 'List of tuples of (schedule_class_params, '
+        'number of steps to use this schedule class)')
+    return p
+
+  def __init__(self, params):
+    super().__init__(params)
+    assert isinstance(self.params.schedule_steps, list)
+    self.schedule_steps = []
+    self.schedule_params = []
+    for (cls_params, steps) in self.params.schedule_steps:
+      if self.schedule_steps:
+        self.schedule_steps.append(steps + self.schedule_steps[-1])
+      else:
+        self.schedule_steps.append(steps)
+      self.schedule_params.append(cls_params)
+
+    self.CreateChildren('schedules', self.schedule_params)
+
+    self.n_schedules = len(self.schedule_steps)
+    self.schedule_idx = 0
+    self.task_step_offset = 0
+    self.cur_probs = self.schedules[0].cur_probs
+
+  def Sample(self, current_step):
+    """Sample a task."""
+
+    to_step = self.schedule_steps[self.schedule_idx]
+
+    if current_step >= to_step and self.schedule_idx < self.n_schedules - 1:
+      self.task_step_offset = to_step
+      self.schedule_idx += 1
+
+    cur_schedule = self.schedules[self.schedule_idx]
+    sampled_task = cur_schedule.Sample(current_step - self.task_step_offset)
+    self.cur_probs = cur_schedule.cur_probs
+
     return sampled_task

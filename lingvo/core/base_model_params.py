@@ -13,21 +13,51 @@
 # limitations under the License.
 # ==============================================================================
 """BaseModelParams class definition."""
+import functools
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+from lingvo import datasets
 from lingvo.core import base_input_generator
 from lingvo.core import base_model
 from lingvo.core import hyperparams
+from lingvo.core import program as program_lib
 
 
-class _BaseModelParams(object):
+# Define some type aliases for common types returned by SingleTaskModelParams
+# and MultiTaskModelParams.
+InputParams = hyperparams.InstantiableParams[
+    base_input_generator.BaseSequenceInputGenerator]
+TaskParams = hyperparams.InstantiableParams[base_model.BaseTask]
+ModelParams = hyperparams.InstantiableParams[base_model.BaseModel]
+
+
+class DatasetError(Exception):
+  """Dataset error exception class."""
+  pass
+
+
+# Cache the GetAllDatasetParams() results, which may include many Task_XXX.
+# Note: datasets inspect _BaseModelParams, so it can not have a cached method.
+@functools.lru_cache(maxsize=8)
+def GetCachedAllDatasetParams(obj):
+  return obj.GetAllDatasetParams()
+
+
+class _BaseModelParams:
   """Base class for storing model Params for a single experiment."""
 
-  @classmethod
-  def GetDatasetParams(cls, dataset):
+  def GetAllDatasetParams(self):
+    """Enumerates all dataset params for this model.
+
+    If implemented, other methods (such as Train, Dev, and Test) will not
+    be treated as dataset specifications.
+
+    Returns:
+      A dict of {dataset_name: dataset_params}. If not implemented, returns
+      None.
+    """
+    return None
+
+  def GetDatasetParams(self, dataset):
     """Convenience function that returns the param for the given dataset name.
 
     Args:
@@ -38,66 +68,84 @@ class _BaseModelParams(object):
       generate a hyperparam for the input data.
 
     Raises:
-      AttributeError: if there is not a `${dataset}` method defined under `cls`.
+      DatasetError: if there is not a `${dataset}` method defined under `cls`.
     """
-    f = getattr(cls, dataset)
+    all_datasets = GetCachedAllDatasetParams(self)
+    if all_datasets is not None:
+      if dataset not in all_datasets.keys():
+        # When `GetAllDatasetParams` is defined, all public methods are ignored.
+        raise DatasetError(f'Dataset {dataset} not found; '
+                           f'available datasets are: {all_datasets.keys()}')
+      return all_datasets.get(dataset)
+
+    try:
+      f = getattr(self, dataset)
+    except AttributeError as e:
+      raise DatasetError(
+          str(e) +
+          '; available datasets are: %s' % datasets.GetDatasets(type(self)))
     return f()
 
 
 class SingleTaskModelParams(_BaseModelParams):
   """Model Params for a `.SingleTaskModel`."""
 
-  @classmethod
-  def Train(cls):
+  def Train(self) -> InputParams:
     """Returns Params for the training dataset."""
     return base_input_generator.BaseSequenceInputGenerator.Params().Set(
         name='Train')
 
-  @classmethod
-  def Dev(cls):
+  def Dev(self) -> InputParams:
     """Returns Params for the development dataset."""
     return base_input_generator.BaseSequenceInputGenerator.Params().Set(
         name='Dev')
 
-  @classmethod
-  def Test(cls):
+  def Test(self) -> InputParams:
     """Returns Params for the testing dataset."""
     return base_input_generator.BaseSequenceInputGenerator.Params().Set(
         name='Test')
 
-  @classmethod
-  def Task(cls):
+  def Task(self) -> TaskParams:
     """Returns task params."""
     raise NotImplementedError('Abstract method')
 
-  @classmethod
-  def Model(cls):
+  def Model(self) -> ModelParams:
     """Returns model params.
 
     Emulates structure of `MultiTaskModelParams`.
     """
-    return base_model.SingleTaskModel.Params(cls.Task())
+    return base_model.SingleTaskModel.Params(self.Task())
+
+  def ProgramSchedule(self):
+    """Returns a schedule for the Executor."""
+    return program_lib.SimpleProgramScheduleForTask(
+        'Train',
+        train_steps_per_loop=self.Task().train.tpu_steps_per_loop,
+        train_summary_interval_steps=self.Task().train.summary_interval_steps,
+        eval_dataset_names=[],
+        eval_steps_per_loop=0,
+        decode_steps_per_loop=0)
 
 
 class MultiTaskModelParams(_BaseModelParams):
   """Model Params for a `.MultiTaskModel`."""
 
-  @classmethod
-  def Train(cls):
+  def Train(self) -> InputParams:
     """Returns Params for the training dataset."""
     return hyperparams.Params()
 
-  @classmethod
-  def Dev(cls):
+  def Dev(self) -> InputParams:
     """Returns Params for the development dataset."""
     return hyperparams.Params()
 
-  @classmethod
-  def Test(cls):
+  def Test(self) -> InputParams:
     """Returns Params for the testing dataset."""
     return hyperparams.Params()
 
-  @classmethod
-  def Model(cls):
+  def Model(self) -> ModelParams:
     """Returns model params."""
+    raise NotImplementedError('Abstract method')
+
+  def ProgramSchedule(self):
+    """Returns a schedule for the Executor."""
     raise NotImplementedError('Abstract method')

@@ -1,8 +1,8 @@
-package(
-    default_visibility = ["//visibility:public"],
-)
+# Placeholder: load py_library
 
-licenses(["notice"])  # Apache 2.0
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
 
 filegroup(
     name = "brown_corpus_wpm_data",
@@ -14,9 +14,10 @@ py_library(
     srcs = ["codelab.py"],
     data = [":brown_corpus_wpm_data"],
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo:model_registry",
         "//lingvo/core:base_model_params",
+        "//lingvo/tasks/mt:base_config",
         "//lingvo/tasks/mt/params",
         "//lingvo/tasks/punctuator:input_generator",
         "//lingvo/tasks/punctuator:model",
@@ -25,7 +26,8 @@ py_library(
 
 py_library(
     name = "params",
-    srcs = ["__init__.py"],
+    srcs = ["params.py"],
+    tags = ["keep_dep"],
     deps = [
         ":codelab",
     ],

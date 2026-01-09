@@ -14,15 +14,14 @@
 # ==============================================================================
 """Tests for test_utils."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
+import lingvo.compat as tf
+from lingvo.core import py_utils
 from lingvo.core import test_utils
 
+FLAGS = tf.flags.FLAGS
 
-class TestUtilsTest(tf.test.TestCase):
+
+class TestUtilsTest(test_utils.TestCase):
 
   def testReplaceGoldenSingleFloat(self):
     old_line = '      CompareToGoldenSingleFloat(self, 1.489712, vs[0])\n'
@@ -51,6 +50,88 @@ class TestUtilsTest(tf.test.TestCase):
     self.assertEqual(old_line, result[2])
     self.assertEqual(new_line, result[3])
 
+  def testEagerSessionAdapterNoFunction(self):
+    with self.session() as sess:
+      self.assertIsInstance(sess, tf.Session)
+      a = tf.Variable(1.0)
+      b = tf.constant(2.0)
+      c = a + b
+      sess.run(tf.global_variables_initializer())
+      self.assertEqual(3.0, sess.run(c))
+
+  def testEagerSessionAdapterWithFunctionNoPlaceholder(self):
+    with self.session() as sess:
+      self.assertIsInstance(sess, tf.Session)
+
+      a = tf.Variable(1.0)
+      traced = False
+
+      @test_utils.DefineAndTrace()
+      def func():
+        nonlocal traced
+        b = tf.constant(2.0)
+        c = a + b
+        traced = True
+        return c
+
+      self.assertTrue(traced)
+      sess.run(tf.global_variables_initializer())
+      self.assertEqual(3.0, sess.run(func))
+
+  def testEagerSessionAdapterWithFunctionAndPlaceholder(self):
+    with self.session() as sess:
+      self.assertIsInstance(sess, tf.Session)
+      a = tf.Variable(1.0)
+      b = tf.placeholder(tf.float32)
+      traced = False
+
+      @test_utils.DefineAndTrace(b)
+      def func(b):
+        nonlocal traced
+        c = a + b
+        traced = True
+        return c
+
+      self.assertTrue(traced)
+      sess.run(tf.global_variables_initializer())
+      self.assertEqual(3.0, sess.run(func, feed_dict={b: 2.0}))
+
+  def testEagerSessionAdapterWithFunctionAcceptingNMap(self):
+    with self.session() as sess:
+      self.assertIsInstance(sess, tf.Session)
+      a = tf.Variable(1, dtype=tf.int32)
+      nmap = py_utils.NestedMap(
+          x=tf.placeholder(tf.int32), y=tf.placeholder(tf.int32))
+      traced = False
+
+      @test_utils.DefineAndTrace(nmap)
+      def func(nmap):
+        nonlocal traced
+        c = py_utils.Transform(lambda t: t + a, nmap)
+        traced = True
+        return c
+
+      self.assertTrue(traced)
+      sess.run(tf.global_variables_initializer())
+      self.assertEqual(
+          py_utils.NestedMap(x=3, y=4),
+          sess.run(func, feed_dict=dict(zip(py_utils.Flatten(nmap), (2, 3)))))
+
+  @test_utils.SkipIfNonEager
+  def testGetScalarSummaryValuesTF2(self):
+    logdir = self.create_tempdir()
+    writer = tf.summary.create_file_writer(logdir.full_path)
+
+    with writer.as_default():
+      for step in range(100):
+        tf.summary.scalar('dummy_metric', step * 2, step=step)
+        writer.flush()
+
+    summaries = self.GetScalarSummaryValuesTF2(logdir.full_path)
+    self.assertEqual(
+        summaries, {'dummy_metric': {s: s * 2 for s in range(100)}}
+    )
+
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()

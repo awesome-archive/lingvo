@@ -1,24 +1,23 @@
-# Image related tasks.
-package(
-    default_visibility = ["//visibility:public"],
-)
+# Placeholder: load py_library
+# Placeholder: load py_test
 
-licenses(["notice"])  # Apache 2.0
+# Image related tasks.
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
 
 py_library(
     name = "classifier",
     srcs = ["classifier.py"],
     deps = [
-        # Implicit numpy dependency.
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
-        "//lingvo/core:base_layer",
+        "//lingvo:compat",
         "//lingvo/core:base_model",
         "//lingvo/core:layers",
-        "//lingvo/core:lr_schedule",
         "//lingvo/core:metrics",
         "//lingvo/core:plot",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -28,12 +27,15 @@ py_test(
     deps = [
         ":classifier",
         ":input_generator",
-        # Implicit tensorflow dependency.
+        #internal proto upb dep
+        "//lingvo:compat",
         "//lingvo:model_registry",
         "//lingvo/core:cluster_factory",
+        "//lingvo/core:layers",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
         "//lingvo/tasks/image/params:mnist",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -41,10 +43,8 @@ py_library(
     name = "input_generator",
     srcs = ["input_generator.py"],
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:base_input_generator",
-        "//lingvo/core:py_utils",
-        "//lingvo/core/ops:py_x_ops",
     ],
 )
 
@@ -53,8 +53,9 @@ py_test(
     srcs = ["input_generator_test.py"],
     deps = [
         ":input_generator",
+        #internal proto upb dep
+        "//lingvo:compat",
+        "//lingvo/core:test_utils",
         # Implicit numpy dependency.
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
     ],
 )

@@ -15,12 +15,12 @@ limitations under the License.
 
 #include <vector>
 
+#include "absl/synchronization/mutex.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/platform/thread_annotations.h"
-#include "lingvo/core/ops/mutex.h"
 
 namespace tensorflow {
 namespace lingvo {
@@ -30,7 +30,6 @@ typedef FunctionLibraryRuntime::Handle FHandle;
 
 void SetRunOptions(OpKernelContext* ctx, FunctionLibraryRuntime::Options* opts,
                    bool always_collect_stats) {
-  opts->step_id = ctx->step_id();
   opts->rendezvous = ctx->rendezvous();
   opts->cancellation_manager = ctx->cancellation_manager();
   if (always_collect_stats) {
@@ -91,7 +90,7 @@ class CachedCallOp : public AsyncOpKernel {
                  }
                  done();
 
-                 MutexLock l(&mu_);
+                 absl::MutexLock l(&mu_);
                  status_ = s;
                  state_ = INITED;
                });
@@ -100,7 +99,7 @@ class CachedCallOp : public AsyncOpKernel {
  private:
   typedef CachedCallOp ME;
 
-  bool NotIniting() const SHARED_LOCKS_REQUIRED(mu_) {
+  bool NotIniting() const ABSL_SHARED_LOCKS_REQUIRED(mu_) {
     return state_ != INITING;
   }
 
@@ -108,8 +107,8 @@ class CachedCallOp : public AsyncOpKernel {
   FunctionLibraryRuntime::Options opts_;
   FHandle handle_;
 
-  Mutex mu_;
-  Condition not_initing_;
+  absl::Mutex mu_;
+  absl::Condition not_initing_;
   enum State {
     UNINIT,
     INITING,

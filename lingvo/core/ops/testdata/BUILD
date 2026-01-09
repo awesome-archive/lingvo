@@ -1,6 +1,6 @@
 package(default_visibility = ["//visibility:public"])
 
-licenses(["notice"])  # Apache 2.0
+licenses(["notice"])
 
 filegroup(
     name = "best_step_testdata",
@@ -36,4 +36,9 @@ filegroup(
 filegroup(
     name = "wmt",
     data = glob(["wmt/*"]),
+)
+
+filegroup(
+    name = "mlperf_vocab",
+    data = ["mlperf.ende.subwords.vocab"],
 )

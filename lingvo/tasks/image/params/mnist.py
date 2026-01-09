@@ -14,10 +14,6 @@
 # ==============================================================================
 """Train models on MNIST data."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from lingvo import model_registry
 from lingvo.core import base_model_params
 from lingvo.tasks.image import classifier
@@ -27,26 +23,23 @@ from lingvo.tasks.image import input_generator
 class Base(base_model_params.SingleTaskModelParams):
   """Input params for MNIST."""
 
-  @classmethod
-  def _Path(cls):
+  @property
+  def path(self):
     # Generated using lingvo/tools:keras2ckpt.
     return '/tmp/mnist/mnist'
 
-  @classmethod
-  def Train(cls):
+  def Train(self):
     p = input_generator.MnistTrainInput.Params()
-    p.ckpt = cls._Path()
+    p.ckpt = self.path
     return p
 
-  @classmethod
-  def Test(cls):
+  def Test(self):
     p = input_generator.MnistTestInput.Params()
-    p.ckpt = cls._Path()
+    p.ckpt = self.path
     return p
 
-  @classmethod
-  def Dev(cls):
-    return cls.Test()
+  def Dev(self):
+    return self.Test()
 
 
 @model_registry.RegisterSingleTaskModel
@@ -56,16 +49,15 @@ class LeNet5(Base):
   BN = False
   DROP = 0.2
 
-  @classmethod
-  def Task(cls):
+  def Task(self):
     p = classifier.ModelV1.Params()
     p.name = 'lenet5'
     # Overall architecture:
     #   conv, maxpool, conv, maxpool, fc, softmax.
     p.filter_shapes = [(5, 5, 1, 20), (5, 5, 20, 50)]
     p.window_shapes = [(2, 2), (2, 2)]
-    p.batch_norm = cls.BN
-    p.dropout_prob = cls.DROP
+    p.batch_norm = self.BN
+    p.dropout_prob = self.DROP
     p.softmax.input_dim = 300
     p.softmax.num_classes = 10
     p.train.save_interval_seconds = 10  # More frequent checkpoints.

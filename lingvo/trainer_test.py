@@ -14,59 +14,79 @@
 # ==============================================================================
 """Tests for trainer."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
+import pathlib
 import random
 import re
 import shutil
+from unittest import mock
 
-import numpy as np
-import tensorflow as tf
-
+from absl.testing import flagsaver
+from absl.testing import parameterized
 from lingvo import base_trial
+from lingvo import eager_runners
 from lingvo import model_registry
+from lingvo import runners
 from lingvo import trainer
+import lingvo.compat as tf
 from lingvo.core import base_input_generator
-from lingvo.core import base_layer
 from lingvo.core import base_model
+from lingvo.core import base_model_params
+from lingvo.core import hyperparams
+from lingvo.core import inference_graph_pb2
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 from lingvo.core import trainer_test_utils
-from lingvo.tasks.image.input_generator import FakeMnistData
-import lingvo.tasks.image.params.mnist  # pylint: disable=unused-import
-import lingvo.tasks.lm.params.one_billion_wds  # pylint: disable=unused-import
+from lingvo.tasks.image import input_generator
+import numpy as np
 
 FLAGS = tf.flags.FLAGS
 
 
-class BaseTrainerTest(tf.test.TestCase):
+def setUpModule():
+  trainer_test_utils.RegisterIdentityRegressionModel(
+      learning_rate=0.025, max_train_steps=100)
+
+
+class BaseTrainerTest(test_utils.TestCase):
   """Base class for the test cases."""
 
   def __init__(self, *args, **kwargs):
-    super(BaseTrainerTest, self).__init__(*args, **kwargs)
+    super().__init__(*args, **kwargs)
     self._trial = base_trial.NoOpTrial()
 
   def setUp(self):
+    super().setUp()
     FLAGS.model_params_override = ''
-    FLAGS.tf_master = tf.train.Server.create_local_server().target
+    FLAGS.tf_master = tf.distribute.Server.create_local_server().target
     FLAGS.vizier_reporting_job = 'decoder'
 
   def _CreateController(self, cfg):
-    return trainer.Controller(cfg, FLAGS.model_task_name, FLAGS.logdir,
+    return runners.Controller(cfg, FLAGS.model_task_name, FLAGS.logdir,
                               FLAGS.tf_master, self._trial)
 
   def _CreateTrainer(self, cfg):
-    return trainer.Trainer(cfg, FLAGS.model_task_name, FLAGS.logdir,
+    if py_utils.IsEagerMode():
+      return eager_runners.Trainer(cfg, FLAGS.model_task_name, FLAGS.logdir,
+                                   FLAGS.tf_master, self._trial)
+
+    return runners.Trainer(cfg, FLAGS.model_task_name, FLAGS.logdir,
                            FLAGS.tf_master, self._trial)
 
   def _CreateEvalerDev(self, cfg):
-    return trainer.Evaler('dev', cfg, FLAGS.model_task_name, FLAGS.logdir,
+    if py_utils.IsEagerMode():
+      return eager_runners.Evaler('dev', cfg, FLAGS.model_task_name,
+                                  FLAGS.logdir, FLAGS.tf_master, self._trial)
+
+    return runners.Evaler('dev', cfg, FLAGS.model_task_name, FLAGS.logdir,
                           FLAGS.tf_master, self._trial)
 
   def _CreateDecoderDev(self, cfg):
-    return trainer.Decoder('dev', cfg, FLAGS.model_task_name, FLAGS.logdir,
+    if py_utils.IsEagerMode():
+      return eager_runners.Decoder('dev', cfg, FLAGS.model_task_name,
+                                   FLAGS.logdir, FLAGS.tf_master, self._trial)
+
+    return runners.Decoder('dev', cfg, FLAGS.model_task_name, FLAGS.logdir,
                            FLAGS.tf_master, self._trial)
 
   def _HasFile(self, files, substr):
@@ -83,42 +103,82 @@ class BaseTrainerTest(tf.test.TestCase):
 
   def _HasLine(self, filename, pattern):
     """Returns True iff one line in the given file matches the pattern."""
-    with tf.gfile.FastGFile(filename, 'r') as f:
+    with tf.io.gfile.GFile(filename, 'r') as f:
       lines = f.readlines()
     return any(re.search(pattern, _) for _ in lines)
 
-
-class TrainerTest(BaseTrainerTest):
-
-  def tearDown(self):
-    if hasattr(self, '_tmpdir'):
-      shutil.rmtree(self._tmpdir)
-
-  def _GetTestConfig(self):
+  def _GetSimpleTestConfig(self):
     model_name = 'image.mnist.LeNet5'
-    cfg = model_registry.GetParams(model_name, 'Dev')
+    cfg = model_registry.GetParams(model_name, 'Train')
     cfg.cluster.task = 0
     cfg.cluster.mode = 'sync'
     cfg.cluster.job = 'trainer_client'
-    cfg.cluster.worker.name = '/job:local'
+    cfg.cluster.worker.name = '/job:localhost'
     cfg.cluster.worker.replicas = 1
     cfg.cluster.worker.gpus_per_replica = 0
-    cfg.cluster.ps.name = '/job:local'
+    cfg.cluster.ps.name = '/job:localhost'
     cfg.cluster.ps.replicas = 1
     cfg.cluster.ps.gpus_per_replica = 0
+    cfg.cluster.reporting_job = FLAGS.vizier_reporting_job
 
     # Generate 2 inputs.
-    self._tmpdir, cfg.input.ckpt = FakeMnistData(train_size=0, test_size=2)
+    cfg.input.ckpt = input_generator.FakeMnistData(
+        self.get_temp_dir(), train_size=2, test_size=2
+    )
     cfg.input.num_samples = 2
+    cfg.input.batch_size = 2
     cfg.train.max_steps = 2
-    cfg.train.ema_decay = 0.9999
+    ema_decay = 0.9999
+    cfg.task.train.ema_decay = ema_decay
+    cfg.train.ema_decay = ema_decay
     return cfg
 
+
+class EmptyTask(base_model.BaseTask):
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.name = 'empty'
+    return p
+
+  def Inference(self):
+    return inference_graph_pb2.InferenceGraph()
+
+
+class EmptyMultiTaskModel(base_model.MultiTaskModel):
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.name = 'empty'
+    p.task_params.Define('a', EmptyTask.Params(), '')
+    p.task_params.Define('b', EmptyTask.Params(), '')
+    return p
+
+
+@model_registry.RegisterMultiTaskModel
+class EmptyMultiTaskParams(base_model_params.MultiTaskModelParams):
+
+  def Test(self):
+    p = base_input_generator.BaseInputGenerator.Params()
+    inputs = hyperparams.Params()
+    for task_name in ['a', 'b']:
+      inputs.Define(task_name, p.Copy(), '')
+    return inputs
+
+  def Model(self):
+    return EmptyMultiTaskModel.Params()
+
+
+class TrainerTest(BaseTrainerTest, parameterized.TestCase):
+
+  @flagsaver.flagsaver
   def testController(self):
     logdir = os.path.join(tf.test.get_temp_dir(),
                           'controller_test' + str(random.random()))
     FLAGS.logdir = logdir
-    cfg = self._GetTestConfig()
+    cfg = self._GetSimpleTestConfig()
 
     runner_manager = trainer.RunnerManager(cfg.name)
 
@@ -126,13 +186,13 @@ class TrainerTest(BaseTrainerTest):
         [self._CreateController(cfg),
          self._CreateTrainer(cfg)])
 
-    train_files = tf.gfile.Glob(logdir + '/train/*')
+    train_files = tf.io.gfile.glob(logdir + '/train/*')
     self.assertTrue(self._HasFile(train_files, 'ckpt'))
     self.assertTrue(self._HasFile(train_files, 'tfevents'))
-    control_files = tf.gfile.Glob(logdir + '/control/*')
+    control_files = tf.io.gfile.glob(logdir + '/control/*')
     self.assertTrue(self._HasFile(control_files, 'params.txt'))
+    self.assertTrue(self._HasFile(control_files, 'params.pbtxt'))
     self.assertTrue(self._HasFile(control_files, 'model_analysis.txt'))
-    self.assertTrue(self._HasFile(control_files, 'train.pbtxt'))
     self.assertTrue(self._HasFile(control_files, 'tfevents'))
 
     # EvalerDev may not run concurrently with Controller in a single process
@@ -140,7 +200,7 @@ class TrainerTest(BaseTrainerTest):
     # steps.
     runner_manager.StartRunners([self._CreateEvalerDev(cfg)])
 
-    dev_files = tf.gfile.Glob(logdir + '/eval_dev/*')
+    dev_files = tf.io.gfile.glob(logdir + '/eval_dev/*')
     self.assertTrue(self._HasFile(dev_files, 'params.txt'))
     self.assertTrue(self._HasFile(dev_files, 'eval_dev.pbtxt'))
     self.assertTrue(self._HasFile(dev_files, 'tfevents'))
@@ -148,50 +208,193 @@ class TrainerTest(BaseTrainerTest):
     self.assertTrue(
         self._HasLine(self._GetMatchedFileName(dev_files, 'score'), 'log_pplx'))
 
+  @flagsaver.flagsaver
   def testDecoder(self):
     logdir = os.path.join(tf.test.get_temp_dir(),
                           'decoder_test' + str(random.random()))
     FLAGS.logdir = logdir
-    cfg = self._GetTestConfig()
-
+    dec_dir = os.path.join(logdir, 'decoder_dev')
+    cfg = self._GetSimpleTestConfig()
     runner_manager = trainer.RunnerManager(cfg.name)
+    runner_manager.StartRunners([
+        self._CreateController(cfg),
+        self._CreateTrainer(cfg),
+    ])
 
-    runner_manager.StartRunners(
-        [self._CreateController(cfg),
-         self._CreateTrainer(cfg)])
-    runner_manager.StartRunners([self._CreateDecoderDev(cfg)])
+    # Test decoding with default settings.
+    with self.subTest(name='DefaultDecoder'):
+      runner_manager.StartRunners([self._CreateDecoderDev(cfg)])
+      dec_files = tf.io.gfile.glob(os.path.join(dec_dir, '*'))
+      self.assertTrue(self._HasFile(dec_files, 'params.txt'))
+      self.assertTrue(self._HasFile(dec_files, 'decoder_dev.pbtxt'))
+      self.assertTrue(self._HasFile(dec_files, 'tfevents'))
+      self.assertTrue(self._HasFile(dec_files, 'processed_ckpts.txt'))
+      # Only the score for the 2-step checkpoint should be present.
+      self.assertFalse(self._HasFile(dec_files, 'score-00000000.txt'))
+      self.assertTrue(self._HasFile(dec_files, 'score-00000002.txt'))
+      self.assertTrue(
+          self._HasLine(
+              self._GetMatchedFileName(dec_files, 'score'), 'examples/sec'))
 
-    dec_files = tf.gfile.Glob(logdir + '/decoder_dev/*')
-    self.assertTrue(self._HasFile(dec_files, 'params.txt'))
-    self.assertTrue(self._HasFile(dec_files, 'decoder_dev.pbtxt'))
-    self.assertTrue(self._HasFile(dec_files, 'tfevents'))
-    self.assertTrue(self._HasFile(dec_files, 'score'))
-    self.assertTrue(
-        self._HasLine(
-            self._GetMatchedFileName(dec_files, 'score'), 'examples/sec'))
+    # Test that checkpoints are not reevaluated when a job is interrupted.
+    score_2_path = os.path.join(dec_dir, 'score-00000002.txt')
+    score_2_mod_time = pathlib.Path(score_2_path).stat().st_mtime
+    with self.subTest(name='DefaultDecoderNoOp'):
+      cfg = self._GetSimpleTestConfig()
+      runner_manager.StartRunners([self._CreateDecoderDev(cfg)])
 
+      dec_files = tf.io.gfile.glob(os.path.join(dec_dir, '*'))
+      self.assertFalse(self._HasFile(dec_files, 'score-00000000.txt'))
+      self.assertEqual(score_2_mod_time,
+                       pathlib.Path(score_2_path).stat().st_mtime)
+
+    # Test decoding a specific checkpoint.
+    with self.subTest(name='LoadCheckpointFrom'):
+      cfg = self._GetSimpleTestConfig()
+      cfg.task.eval.load_checkpoint_from = os.path.join(logdir,
+                                                        'train/ckpt-00000000')
+      runner_manager.StartRunners([self._CreateDecoderDev(cfg)])
+      dec_files = tf.io.gfile.glob(os.path.join(dec_dir, '*'))
+
+      # Scores for both checkpoints should be present...
+      self.assertTrue(self._HasFile(dec_files, 'score-00000000.txt'))
+      self.assertTrue(self._HasFile(dec_files, 'score-00000002.txt'))
+      # ... but only the score for the 0-step checkpoint should be modified.
+      self.assertEqual(score_2_mod_time,
+                       pathlib.Path(score_2_path).stat().st_mtime)
+
+    # Reset the decoder's cached state and test decoding all checkpoints.
+    shutil.rmtree(dec_dir)
+    with self.subTest(name='DecodeAllCheckpoints'):
+      cfg = self._GetSimpleTestConfig()
+      cfg.task.eval.decode_all_checkpoints = True
+      runner_manager.StartRunners([self._CreateDecoderDev(cfg)])
+      dec_files = tf.io.gfile.glob(os.path.join(dec_dir, '*'))
+      self.assertTrue(self._HasFile(dec_files, 'score-00000000.txt'))
+      self.assertTrue(self._HasFile(dec_files, 'score-00000002.txt'))
+
+    # Test that decode_all_checkpoints on an already decoded dir is a no-op.
+    score_2_mod_time = pathlib.Path(score_2_path).stat().st_mtime
+    with self.subTest(name='DecodeAllCheckpointsNoOp'):
+      runner_manager.StartRunners([self._CreateDecoderDev(cfg)])
+      self.assertEqual(score_2_mod_time,
+                       pathlib.Path(score_2_path).stat().st_mtime)
+
+  @flagsaver.flagsaver
   def testWriteInferenceGraph(self):
     random.seed()
     logdir = os.path.join(tf.test.get_temp_dir(),
                           'inference_graphs' + str(random.random()))
     FLAGS.logdir = logdir
-    cfg = 'lm.one_billion_wds.WordLevelOneBwdsSimpleSampledSoftmax'
+    cfg = 'punctuator.codelab.RNMTModel'
     trainer.RunnerManager(cfg).WriteInferenceGraph()
-    inference_files = tf.gfile.Glob(logdir + '/inference_graphs/*')
+    inference_files = tf.io.gfile.glob(logdir + '/inference_graphs/*')
     self.assertTrue(self._HasFile(inference_files, 'inference.pbtxt'))
     self.assertTrue(self._HasFile(inference_files, 'inference_tpu.pbtxt'))
 
+  @flagsaver.flagsaver(model_task_name='a')
+  def testWriteOneOfMultiTaskInferenceGraph(self):
+    random.seed()
+    logdir = os.path.join(tf.test.get_temp_dir(),
+                          'inference_graphs' + str(random.random()))
+    FLAGS.logdir = logdir
+    cfg = 'test.EmptyMultiTaskParams'
+    trainer.RunnerManager(cfg).WriteInferenceGraph()
+    inference_files = tf.io.gfile.glob(logdir + '/inference_graphs/*')
+    self.assertTrue(self._HasFile(inference_files, 'a_inference.pbtxt'))
+    self.assertTrue(self._HasFile(inference_files, 'a_inference_tpu.pbtxt'))
+    self.assertFalse(self._HasFile(inference_files, 'b_inference.pbtxt'))
+    self.assertFalse(self._HasFile(inference_files, 'b_inference_tpu.pbtxt'))
 
-class TrainerWithTrialTest(TrainerTest):
+  @flagsaver.flagsaver
+  def testWriteMultiTaskInferenceGraph(self):
+    random.seed()
+    logdir = os.path.join(tf.test.get_temp_dir(),
+                          'inference_graphs' + str(random.random()))
+    FLAGS.logdir = logdir
+    cfg = 'test.EmptyMultiTaskParams'
+    trainer.RunnerManager(cfg).WriteInferenceGraph()
+    inference_files = tf.io.gfile.glob(logdir + '/inference_graphs/*')
+    self.assertTrue(self._HasFile(inference_files, 'a_inference.pbtxt'))
+    self.assertTrue(self._HasFile(inference_files, 'a_inference_tpu.pbtxt'))
+    self.assertTrue(self._HasFile(inference_files, 'b_inference.pbtxt'))
+    self.assertTrue(self._HasFile(inference_files, 'b_inference_tpu.pbtxt'))
 
+  @flagsaver.flagsaver
+  def testRunLocally(self):
+    logdir = os.path.join(
+        tf.test.get_temp_dir(), 'run_locally_test' + str(random.random())
+    )
+    FLAGS.logdir = logdir
+    FLAGS.run_locally = 'cpu'
+    FLAGS.mode = 'sync'
+    FLAGS.model = 'image.mnist.LeNet5'
+    FLAGS.model_params_override = (
+        'train.max_steps: 2; input.num_samples: 2; input.ckpt: %s'
+        % input_generator.FakeMnistData(
+            self.get_temp_dir(), train_size=2, test_size=2
+        )
+    )
+    trainer.main(None)
+
+    train_files = tf.io.gfile.glob(logdir + '/train/*')
+    self.assertTrue(self._HasFile(train_files, 'ckpt'))
+    self.assertTrue(self._HasFile(train_files, 'tfevents'))
+    control_files = tf.io.gfile.glob(logdir + '/control/*')
+    self.assertTrue(self._HasFile(control_files, 'params.txt'))
+    self.assertTrue(self._HasFile(control_files, 'model_analysis.txt'))
+    self.assertTrue(self._HasFile(control_files, 'tfevents'))
+
+  @flagsaver.flagsaver
+  def testRunLocallyCheckpointInTrainerCpu(self):
+    logdir = os.path.join(
+        tf.test.get_temp_dir(), 'run_locally_test' + str(random.random())
+    )
+    FLAGS.logdir = logdir
+    FLAGS.run_locally = 'cpu'
+    FLAGS.mode = 'sync'
+    FLAGS.model = 'image.mnist.LeNet5'
+    FLAGS.checkpoint_in_trainer_cpu = True
+    FLAGS.model_params_override = (
+        'train.max_steps: 2; input.num_samples: 2; input.ckpt: %s'
+        % input_generator.FakeMnistData(
+            self.get_temp_dir(), train_size=2, test_size=2
+        )
+    )
+    trainer.main(None)
+
+    train_files = tf.io.gfile.glob(logdir + '/train/*')
+    self.assertTrue(self._HasFile(train_files, 'ckpt'))
+    self.assertTrue(self._HasFile(train_files, 'tfevents'))
+    control_files = tf.io.gfile.glob(logdir + '/control/*')
+    self.assertTrue(self._HasFile(control_files, 'params.txt'))
+    self.assertTrue(self._HasFile(control_files, 'model_analysis.txt'))
+    self.assertTrue(self._HasFile(control_files, 'tfevents'))
+
+  @parameterized.named_parameters(('Evaler', runners.Evaler),
+                                  ('Decoder', runners.Decoder))
+  def testEMA(self, cls):
+    logdir = os.path.join(tf.test.get_temp_dir(),
+                          'ema_test' + str(random.random()))
+    FLAGS.logdir = logdir
+    cfg = self._GetSimpleTestConfig()
+    runner = cls('dev', cfg, FLAGS.model_task_name, FLAGS.logdir,
+                 FLAGS.tf_master, self._trial)
+    var_list = runner._checkpointer._saver._var_list  # pylint: disable=protected-access
+    self.assertIsInstance(var_list, list)
+
+
+class TrainerWithTrialTest(BaseTrainerTest):
+
+  @flagsaver.flagsaver
   def testControllerTrainerEvaler(self):
-    trial = tf.test.mock.create_autospec(base_trial.Trial, instance=True)
+    trial = mock.create_autospec(base_trial.Trial, instance=True)
     self._trial = trial
 
     logdir = os.path.join(tf.test.get_temp_dir(),
                           'controller_test' + str(random.random()))
     FLAGS.logdir = logdir
-    cfg = self._GetTestConfig()
+    cfg = self._GetSimpleTestConfig()
 
     trial.Name.return_value = 'trial1'
 
@@ -207,16 +410,16 @@ class TrainerWithTrialTest(TrainerTest):
     # Stop trial once ReportEvalMeasure is called.
     trial.ReportEvalMeasure.return_value = True
 
-    runners = [self._CreateController(cfg), self._CreateTrainer(cfg)]
+    all_runners = [self._CreateController(cfg), self._CreateTrainer(cfg)]
     # Param override works.
-    for runner in runners:
+    for runner in all_runners:
       self.assertEqual(runner.params.task.softmax.num_classes, 20)
       self.assertEqual(runner.params.task.filter_shapes, [(5, 5, 1, 10),
                                                           (5, 5, 10, 50)])
       self.assertEqual(runner.params.task.train.lr_schedule.decay_start, 100)
 
     runner_manager = trainer.RunnerManager(cfg.name)
-    runner_manager.StartRunners(runners)
+    runner_manager.StartRunners(all_runners)
     # Controller and trainer check whether the trial is stopped.
     self.assertGreater(trial.OverrideModelParams.call_count, 0)
     self.assertGreater(trial.ShouldStop.call_count, 0)
@@ -225,13 +428,14 @@ class TrainerWithTrialTest(TrainerTest):
     # report_done.
     self.assertEqual(trial.ReportEvalMeasure.call_count, 0)
 
-    train_files = tf.gfile.Glob(logdir + '/train/*')
+    train_files = tf.io.gfile.glob(logdir + '/train/*')
+    self.assertTrue(self._HasFile(train_files, 'params.txt'))
+    self.assertTrue(self._HasFile(train_files, 'trainer_params.txt'))
     self.assertTrue(self._HasFile(train_files, 'ckpt'))
     self.assertTrue(self._HasFile(train_files, 'tfevents'))
-    control_files = tf.gfile.Glob(logdir + '/control/*')
+    control_files = tf.io.gfile.glob(logdir + '/control/*')
     self.assertTrue(self._HasFile(control_files, 'params.txt'))
     self.assertTrue(self._HasFile(control_files, 'model_analysis.txt'))
-    self.assertTrue(self._HasFile(control_files, 'train.pbtxt'))
     self.assertTrue(self._HasFile(control_files, 'tfevents'))
 
     # EvalerDev may not run concurrently with Controller in a single process
@@ -246,7 +450,7 @@ class TrainerWithTrialTest(TrainerTest):
     after_decoder_count = trial.ReportEvalMeasure.call_count
     self.assertGreater(after_decoder_count, 0)
 
-    dev_files = tf.gfile.Glob(logdir + '/eval_dev/*')
+    dev_files = tf.io.gfile.glob(logdir + '/eval_dev/*')
     self.assertTrue(self._HasFile(dev_files, 'params.txt'))
     self.assertTrue(self._HasFile(dev_files, 'eval_dev.pbtxt'))
     self.assertTrue(self._HasFile(dev_files, 'tfevents'))
@@ -257,30 +461,30 @@ class TrainerWithTrialTest(TrainerTest):
 
 class ProcessFPropResultsTest(BaseTrainerTest):
 
+  @flagsaver.flagsaver
   def testIdentityRegressionModel(self):
     logdir = os.path.join(tf.test.get_temp_dir(),
                           'identity_regression_test' + str(random.random()))
     FLAGS.logdir = logdir
 
-    steps = 100
-    cfg = trainer_test_utils.IdentityRegressionModel.Params()
+    cfg = model_registry.GetParams(
+        'lingvo.core.trainer_test_utils.IdentityRegressionModel', 'Train')
     cfg.cluster.task = 0
     cfg.cluster.mode = 'sync'
     cfg.cluster.job = 'trainer_client'
-    cfg.cluster.worker.name = '/job:local'
+    cfg.cluster.worker.name = '/job:localhost'
     cfg.cluster.worker.replicas = 1
     cfg.cluster.worker.gpus_per_replica = 0
-    cfg.cluster.ps.name = '/job:local'
+    cfg.cluster.ps.name = '/job:localhost'
     cfg.cluster.ps.replicas = 1
     cfg.cluster.ps.gpus_per_replica = 0
-    cfg.train.max_steps = steps
-    cfg.task.train.learning_rate = 0.025
+    steps = cfg.train.max_steps
 
-    runners = [self._CreateController(cfg), self._CreateTrainer(cfg)]
+    all_runners = [self._CreateController(cfg), self._CreateTrainer(cfg)]
 
     runner_manager = trainer.RunnerManager(cfg.name)
-    runner_manager.StartRunners(runners)
-    train = runners[1]
+    runner_manager.StartRunners(all_runners)
+    train = all_runners[1]
 
     # ProcessFPropResults should have been called <steps> times on the task
     # and <steps> times on the model.
@@ -337,4 +541,4 @@ class ProcessFPropResultsTest(BaseTrainerTest):
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  test_utils.main()
